@@ -564,7 +564,7 @@ func addCustomHeaders(h http.Handler) http.Handler {
 	})
 }
 
-
+// Http SecurityHeaders 
 func addSecurityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := w.Header()
