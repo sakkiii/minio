@@ -5,6 +5,7 @@ on:
     branches:
     - master
     - patch-1
+    - patch-2
 
 jobs:
   build:
