@@ -482,8 +482,7 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 		if disk == nil {
 			continue
 		}
-		writers[i] = newBitrotWriter(disk, minioMetaTmpBucket, tmpPartPath,
-			erasure.ShardFileSize(data.Size()), DefaultBitrotAlgorithm, erasure.ShardSize(), false)
+		writers[i] = newBitrotWriter(disk, minioMetaTmpBucket, tmpPartPath, erasure.ShardFileSize(data.Size()), DefaultBitrotAlgorithm, erasure.ShardSize())
 	}
 
 	n, err := erasure.Encode(rctx, data, writers, buffer, writeQuorum)
@@ -755,8 +754,6 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 	if opts.ParentIsObject != nil && opts.ParentIsObject(rctx, bucket, path.Dir(object)) {
 		return oi, toObjectErr(errFileParentIsFile, bucket, object)
 	}
-
-	defer ObjectPathUpdated(pathJoin(bucket, object))
 
 	// Calculate s3 compatible md5sum for complete multipart.
 	s3MD5 := getCompleteMultipartMD5(parts)

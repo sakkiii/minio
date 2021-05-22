@@ -64,7 +64,8 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		return oi, NotImplemented{}
 	}
 
-	defer ObjectPathUpdated(pathJoin(dstBucket, dstObject))
+	defer NSUpdated(dstBucket, dstObject)
+
 	if !dstOpts.NoLock {
 		lk := er.NewNSLock(dstBucket, dstObject)
 		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
@@ -526,8 +527,7 @@ func undoRename(disks []StorageAPI, srcBucket, srcEntry, dstBucket, dstEntry str
 
 // Similar to rename but renames data from srcEntry to dstEntry at dataDir
 func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry string, metadata []FileInfo, dstBucket, dstEntry string, writeQuorum int) ([]StorageAPI, error) {
-	defer ObjectPathUpdated(pathJoin(srcBucket, srcEntry))
-	defer ObjectPathUpdated(pathJoin(dstBucket, dstEntry))
+	defer NSUpdated(dstBucket, dstEntry)
 
 	g := errgroup.WithNErrs(len(disks))
 
@@ -567,8 +567,7 @@ func rename(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry, dstBuc
 		dstEntry = retainSlash(dstEntry)
 		srcEntry = retainSlash(srcEntry)
 	}
-	defer ObjectPathUpdated(pathJoin(srcBucket, srcEntry))
-	defer ObjectPathUpdated(pathJoin(dstBucket, dstEntry))
+	defer NSUpdated(dstBucket, dstEntry)
 
 	g := errgroup.WithNErrs(len(disks))
 
@@ -611,14 +610,8 @@ func (er erasureObjects) PutObject(ctx context.Context, bucket string, object st
 
 // putObject wrapper for erasureObjects PutObject
 func (er erasureObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	defer func() {
-		ObjectPathUpdated(pathJoin(bucket, object))
-	}()
-
 	data := r.Reader
 
-	uniqueID := mustGetUUID()
-	tempObj := uniqueID
 	// No metadata is set, allocate a new one.
 	if opts.UserDefined == nil {
 		opts.UserDefined = make(map[string]string)
@@ -664,7 +657,10 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	if opts.Versioned && fi.VersionID == "" {
 		fi.VersionID = mustGetUUID()
 	}
+
 	fi.DataDir = mustGetUUID()
+	uniqueID := mustGetUUID()
+	tempObj := uniqueID
 
 	// Initialize erasure metadata.
 	for index := range partsMetadata {
@@ -737,8 +733,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 			writers[i] = newStreamingBitrotWriterBuffer(inlineBuffers[i], DefaultBitrotAlgorithm, erasure.ShardSize())
 			continue
 		}
-		writers[i] = newBitrotWriter(disk, minioMetaTmpBucket, tempErasureObj,
-			shardFileSize, DefaultBitrotAlgorithm, erasure.ShardSize(), false)
+		writers[i] = newBitrotWriter(disk, minioMetaTmpBucket, tempErasureObj, shardFileSize, DefaultBitrotAlgorithm, erasure.ShardSize())
 	}
 
 	n, erasureErr := erasure.Encode(ctx, data, writers, buffer, writeQuorum)
@@ -832,7 +827,6 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 }
 
 func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object string, writeQuorum int, fi FileInfo, forceDelMarker bool) error {
-	defer ObjectPathUpdated(pathJoin(bucket, object))
 	disks := er.getDisks()
 	g := errgroup.WithNErrs(len(disks))
 	for index := range disks {
@@ -848,37 +842,11 @@ func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object
 	return reduceWriteQuorumErrs(ctx, g.Wait(), objectOpIgnoredErrs, writeQuorum)
 }
 
-// deleteEmptyDir knows only how to remove an empty directory (not the empty object with a
-// trailing slash), this is called for the healing code to remove such directories.
-func (er erasureObjects) deleteEmptyDir(ctx context.Context, bucket, object string) error {
-	defer ObjectPathUpdated(pathJoin(bucket, object))
-
-	if bucket == minioMetaTmpBucket {
-		return nil
-	}
-
-	disks := er.getDisks()
-	g := errgroup.WithNErrs(len(disks))
-	for index := range disks {
-		index := index
-		g.Go(func() error {
-			if disks[index] == nil {
-				return errDiskNotFound
-			}
-			return disks[index].Delete(ctx, bucket, object, false)
-		}, index)
-	}
-
-	// return errors if any during deletion
-	return reduceWriteQuorumErrs(ctx, g.Wait(), objectOpIgnoredErrs, len(disks)/2+1)
-}
-
 // deleteObject - wrapper for delete object, deletes an object from
 // all the disks in parallel, including `xl.meta` associated with the
 // object.
 func (er erasureObjects) deleteObject(ctx context.Context, bucket, object string, writeQuorum int) error {
 	var err error
-	defer ObjectPathUpdated(pathJoin(bucket, object))
 
 	disks := er.getDisks()
 	tmpObj := mustGetUUID()
@@ -1004,7 +972,7 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 		}
 
 		if errs[objIndex] == nil {
-			ObjectPathUpdated(pathJoin(bucket, objects[objIndex].ObjectName))
+			NSUpdated(bucket, objects[objIndex].ObjectName)
 		}
 
 		if versions[objIndex].Deleted {
@@ -1064,6 +1032,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 			return objInfo, gerr
 		}
 	}
+
+	defer NSUpdated(bucket, object)
+
 	// Acquire a write lock before deleting the object.
 	lk := er.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
@@ -1324,6 +1295,8 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 	if err != nil {
 		return err
 	}
+	defer NSUpdated(bucket, object)
+
 	// Acquire write lock before starting to transition the object.
 	lk := er.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
@@ -1444,9 +1417,6 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 // restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
 // as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
 func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
-	defer func() {
-		ObjectPathUpdated(pathJoin(bucket, object))
-	}()
 	setRestoreHeaderFn := func(oi ObjectInfo, rerr error) error {
 		er.updateRestoreMetadata(ctx, bucket, object, oi, opts, rerr)
 		return rerr

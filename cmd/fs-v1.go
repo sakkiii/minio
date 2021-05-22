@@ -239,6 +239,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 
 // NSScanner returns data usage stats of the current FS deployment
 func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- madmin.DataUsageInfo) error {
+	defer close(updates)
 	// Load bucket totals
 	var totalCache dataUsageCache
 	err := totalCache.load(ctx, fs, dataUsageCacheName)
@@ -273,7 +274,21 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 			bCache.Info.Name = b.Name
 		}
 		bCache.Info.BloomFilter = totalCache.Info.BloomFilter
-
+		upds := make(chan dataUsageEntry, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for update := range upds {
+				totalCache.replace(b.Name, dataUsageRoot, update)
+				if intDataUpdateTracker.debug {
+					logger.Info(color.Green("NSScanner:")+" Got update:", len(totalCache.Cache))
+				}
+				cloned := totalCache.clone()
+				updates <- cloned.dui(dataUsageRoot, buckets)
+			}
+		}()
+		bCache.Info.updates = upds
 		cache, err := fs.scanBucket(ctx, b.Name, bCache)
 		select {
 		case <-ctx.Done():
@@ -282,6 +297,7 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 		}
 		logger.LogIf(ctx, err)
 		cache.Info.BloomFilter = nil
+		wg.Wait()
 
 		if cache.root() == nil {
 			if intDataUpdateTracker.debug {
@@ -407,7 +423,8 @@ func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, 
 		return BucketNameInvalid{Bucket: bucket}
 	}
 
-	defer ObjectPathUpdated(bucket + slashSeparator)
+	defer NSUpdated(bucket, slashSeparator)
+
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
@@ -553,6 +570,8 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 // DeleteBucket - delete a bucket and all the metadata associated
 // with the bucket including pending multipart, object metadata.
 func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+	defer NSUpdated(bucket, slashSeparator)
+
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
@@ -606,7 +625,7 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	}
 
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
-	defer ObjectPathUpdated(path.Join(dstBucket, dstObject))
+	defer NSUpdated(dstBucket, dstObject)
 
 	if !cpSrcDstSame {
 		objectDWLock := fs.NewNSLock(dstBucket, dstObject)
@@ -1079,6 +1098,8 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, err
 	}
 
+	defer NSUpdated(bucket, object)
+
 	// Lock the object.
 	lk := fs.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
@@ -1088,7 +1109,6 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx.Cancel)
-	defer ObjectPathUpdated(path.Join(bucket, object))
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
@@ -1256,6 +1276,8 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		}
 	}
 
+	defer NSUpdated(bucket, object)
+
 	// Acquire a write lock before deleting the object.
 	lk := fs.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
@@ -1268,8 +1290,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
 		return objInfo, err
 	}
-
-	defer ObjectPathUpdated(path.Join(bucket, object))
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {

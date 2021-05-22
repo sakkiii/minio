@@ -198,6 +198,9 @@ func getLatestFileInfo(ctx context.Context, partsMetadata []FileInfo, errs []err
 //   a not-found error or a hash-mismatch error.
 func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo, errs []error, bucket,
 	object string, scanMode madmin.HealScanMode) ([]StorageAPI, []error) {
+	// List of disks having latest version of the object er.meta  (by modtime)
+	_, modTime, dataDir := listOnlineDisks(onlineDisks, partsMetadata, errs)
+
 	availableDisks := make([]StorageAPI, len(onlineDisks))
 	dataErrs := make([]error, len(onlineDisks))
 	inconsistent := 0
@@ -236,6 +239,13 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 			continue
 		}
 		meta := partsMetadata[i]
+
+		if !meta.ModTime.Equal(modTime) || meta.DataDir != dataDir {
+			dataErrs[i] = errFileCorrupt
+			partsMetadata[i] = FileInfo{}
+			continue
+		}
+
 		if erasureDistributionReliable {
 			if !meta.IsValid() {
 				continue
@@ -261,7 +271,7 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 		// Always check data, if we got it.
 		if (len(meta.Data) > 0 || meta.Size == 0) && len(meta.Parts) > 0 {
 			checksumInfo := meta.Erasure.GetChecksumInfo(meta.Parts[0].Number)
-			dataErrs[i] = bitrotVerify(bytes.NewBuffer(meta.Data),
+			dataErrs[i] = bitrotVerify(bytes.NewReader(meta.Data),
 				int64(len(meta.Data)),
 				meta.Erasure.ShardFileSize(meta.Size),
 				checksumInfo.Algorithm,

@@ -98,16 +98,33 @@ func isValidVolname(volname string) bool {
 	return true
 }
 
+var (
+	xlPoolReallyLarge = sync.Pool{
+		New: func() interface{} {
+			b := disk.AlignedBlock(blockSizeReallyLarge)
+			return &b
+		},
+	}
+	xlPoolLarge = sync.Pool{
+		New: func() interface{} {
+			b := disk.AlignedBlock(blockSizeLarge)
+			return &b
+		},
+	}
+	xlPoolSmall = sync.Pool{
+		New: func() interface{} {
+			b := disk.AlignedBlock(blockSizeSmall)
+			return &b
+		},
+	}
+)
+
 // xlStorage - implements StorageAPI interface.
 type xlStorage struct {
 	diskPath string
 	endpoint Endpoint
 
 	globalSync bool
-
-	poolReallyLarge sync.Pool
-	poolLarge       sync.Pool
-	poolSmall       sync.Pool
 
 	rootDisk bool
 
@@ -254,26 +271,8 @@ func newXLStorage(ep Endpoint) (*xlStorage, error) {
 	}
 
 	p := &xlStorage{
-		diskPath: path,
-		endpoint: ep,
-		poolReallyLarge: sync.Pool{
-			New: func() interface{} {
-				b := disk.AlignedBlock(blockSizeReallyLarge)
-				return &b
-			},
-		},
-		poolLarge: sync.Pool{
-			New: func() interface{} {
-				b := disk.AlignedBlock(blockSizeLarge)
-				return &b
-			},
-		},
-		poolSmall: sync.Pool{
-			New: func() interface{} {
-				b := disk.AlignedBlock(blockSizeSmall)
-				return &b
-			},
-		},
+		diskPath:   path,
+		endpoint:   ep,
 		globalSync: env.Get(config.EnvFSOSync, config.EnableOff) == config.EnableOn,
 		ctx:        GlobalContext,
 		rootDisk:   rootDisk,
@@ -292,7 +291,7 @@ func newXLStorage(ep Endpoint) (*xlStorage, error) {
 	_, _ = rand.Read(rnd[:])
 	tmpFile := ".writable-check-" + hex.EncodeToString(rnd[:]) + ".tmp"
 	filePath := pathJoin(p.diskPath, minioMetaTmpBucket, tmpFile)
-	w, err := disk.OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
+	w, err := OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
 	if err != nil {
 		return p, err
 	}
@@ -385,7 +384,22 @@ func (s *xlStorage) Healing() *healingTracker {
 	return &h
 }
 
-func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
+func (s *xlStorage) readMetadata(itemPath string) ([]byte, error) {
+	f, err := os.OpenFile(itemPath, readMode, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return readXLMetaNoData(f, stat.Size())
+}
+
+func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry) (dataUsageCache, error) {
+	// Updates must be closed before we return.
+	defer close(updates)
 	var lc *lifecycle.Lifecycle
 	var err error
 
@@ -410,6 +424,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUs
 	globalHealConfigMu.Lock()
 	healOpts := globalHealConfig
 	globalHealConfigMu.Unlock()
+	cache.Info.updates = updates
 
 	dataUsageInfo, err := scanDataFolder(ctx, s.diskPath, cache, func(item scannerItem) (sizeSummary, error) {
 		// Look for `xl.meta/xl.json' at the leaf.
@@ -419,7 +434,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUs
 			return sizeSummary{}, errSkipFile
 		}
 
-		buf, err := xioutil.ReadFile(item.Path)
+		buf, err := s.readMetadata(item.Path)
 		if err != nil {
 			if intDataUpdateTracker.debug {
 				console.Debugf(color.Green("scannerBucket:")+" object path missing: %v: %w\n", item.Path, err)
@@ -1105,7 +1120,7 @@ func (s *xlStorage) readAllData(volumeDir string, filePath string, requireDirect
 	var r io.ReadCloser
 	if requireDirectIO {
 		var f *os.File
-		f, err = disk.OpenFileDirectIO(filePath, readMode, 0666)
+		f, err = OpenFileDirectIO(filePath, readMode, 0666)
 		r = &odirectReader{f, nil, nil, true, true, s, nil}
 	} else {
 		r, err = OpenFile(filePath, readMode, 0)
@@ -1323,9 +1338,9 @@ func (o *odirectReader) Read(buf []byte) (n int, err error) {
 	}
 	if o.buf == nil {
 		if o.smallFile {
-			o.bufp = o.s.poolSmall.Get().(*[]byte)
+			o.bufp = xlPoolSmall.Get().(*[]byte)
 		} else {
-			o.bufp = o.s.poolLarge.Get().(*[]byte)
+			o.bufp = xlPoolLarge.Get().(*[]byte)
 		}
 	}
 	if o.freshRead {
@@ -1367,9 +1382,9 @@ func (o *odirectReader) Read(buf []byte) (n int, err error) {
 // Close - Release the buffer and close the file.
 func (o *odirectReader) Close() error {
 	if o.smallFile {
-		o.s.poolSmall.Put(o.bufp)
+		xlPoolSmall.Put(o.bufp)
 	} else {
-		o.s.poolLarge.Put(o.bufp)
+		xlPoolLarge.Put(o.bufp)
 	}
 	return o.f.Close()
 }
@@ -1394,7 +1409,7 @@ func (s *xlStorage) ReadFileStream(ctx context.Context, volume, path string, off
 	var file *os.File
 	// O_DIRECT only supported if offset is zero
 	if offset == 0 && globalStorageClass.GetDMA() == storageclass.DMAReadWrite {
-		file, err = disk.OpenFileDirectIO(filePath, readMode, 0666)
+		file, err = OpenFileDirectIO(filePath, readMode, 0666)
 	} else {
 		// Open the file for reading.
 		file, err = OpenFile(filePath, readMode, 0666)
@@ -1515,7 +1530,7 @@ func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSiz
 	if fileSize >= 0 && fileSize <= smallFileThreshold {
 		// For streams smaller than 128KiB we simply write them as O_DSYNC (fdatasync)
 		// and not O_DIRECT to avoid the complexities of aligned I/O.
-		w, err := s.openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+		w, err := s.openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL)
 		if err != nil {
 			return err
 		}
@@ -1554,11 +1569,11 @@ func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSiz
 	var bufp *[]byte
 	if fileSize > 0 && fileSize >= reallyLargeFileThreshold {
 		// use a larger 4MiB buffer for really large streams.
-		bufp = s.poolReallyLarge.Get().(*[]byte)
-		defer s.poolReallyLarge.Put(bufp)
+		bufp = xlPoolReallyLarge.Get().(*[]byte)
+		defer xlPoolReallyLarge.Put(bufp)
 	} else {
-		bufp = s.poolLarge.Get().(*[]byte)
-		defer s.poolLarge.Put(bufp)
+		bufp = xlPoolLarge.Get().(*[]byte)
+		defer xlPoolLarge.Put(bufp)
 	}
 
 	written, err := xioutil.CopyAligned(w, r, *bufp, fileSize)
