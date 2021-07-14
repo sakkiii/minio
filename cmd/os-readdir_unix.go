@@ -98,16 +98,11 @@ func parseDirEnt(buf []byte) (consumed int, name []byte, typ os.FileMode, err er
 	return consumed, nameBuf[:nameLen], typ, nil
 }
 
-// Return all the entries at the directory dirPath.
-func readDir(dirPath string) (entries []string, err error) {
-	return readDirN(dirPath, -1)
-}
-
 // readDirFn applies the fn() function on each entries at dirPath, doesn't recurse into
 // the directory itself, if the dirPath doesn't exist this function doesn't return
 // an error.
 func readDirFn(dirPath string, fn func(name string, typ os.FileMode) error) error {
-	f, err := os.Open(dirPath)
+	f, err := Open(dirPath)
 	if err != nil {
 		if osErrToFileErr(err) == errFileNotFound {
 			return nil
@@ -184,8 +179,8 @@ func readDirFn(dirPath string, fn func(name string, typ os.FileMode) error) erro
 
 // Return count entries at the directory dirPath and all entries
 // if count is set to -1
-func readDirN(dirPath string, count int) (entries []string, err error) {
-	f, err := os.Open(dirPath)
+func readDirWithOpts(dirPath string, opts readDirOpts) (entries []string, err error) {
+	f, err := Open(dirPath)
 	if err != nil {
 		return nil, osErrToFileErr(err)
 	}
@@ -201,6 +196,8 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 
 	boff := 0 // starting read position in buf
 	nbuf := 0 // end valid data in buf
+
+	count := opts.count
 
 	for count != 0 {
 		if boff >= nbuf {
@@ -229,7 +226,7 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 		// support Dirent.Type and have DT_UNKNOWN (0) there
 		// instead.
 		if typ == unexpectedFileMode || typ&os.ModeSymlink == os.ModeSymlink {
-			fi, err := os.Stat(pathJoin(dirPath, string(name)))
+			fi, err := Stat(pathJoin(dirPath, string(name)))
 			if err != nil {
 				// It got deleted in the meantime, not found
 				// or returns too many symlinks ignore this
@@ -242,7 +239,7 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 			}
 
 			// Ignore symlinked directories.
-			if typ&os.ModeSymlink == os.ModeSymlink && fi.IsDir() {
+			if !opts.followDirSymlink && typ&os.ModeSymlink == os.ModeSymlink && fi.IsDir() {
 				continue
 			}
 

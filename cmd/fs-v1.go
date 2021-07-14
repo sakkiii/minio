@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -37,15 +38,15 @@ import (
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	"github.com/minio/minio/cmd/config"
-	xhttp "github.com/minio/minio/cmd/http"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/bucket/policy"
-	"github.com/minio/minio/pkg/color"
-	xioutil "github.com/minio/minio/pkg/ioutil"
-	"github.com/minio/minio/pkg/lock"
-	"github.com/minio/minio/pkg/mimedb"
-	"github.com/minio/minio/pkg/mountinfo"
+	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/config"
+	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
+	"github.com/minio/minio/internal/lock"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/mountinfo"
+	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/mimedb"
 )
 
 // Default etag is used for pre-existing objects.
@@ -226,6 +227,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 	storageInfo := StorageInfo{
 		Disks: []madmin.Disk{
 			{
+				State:          madmin.DriveStateOk,
 				TotalSpace:     di.Total,
 				UsedSpace:      di.Used,
 				AvailableSpace: di.Free,
@@ -251,6 +253,12 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 	if err != nil {
 		return err
 	}
+	if len(buckets) == 0 {
+		totalCache.keepBuckets(buckets)
+		updates <- totalCache.dui(dataUsageRoot, buckets)
+		return nil
+	}
+
 	totalCache.Info.BloomFilter = bf.bytes()
 
 	// Clear totals.
@@ -333,6 +341,8 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 // The updated cache for the bucket is returned.
 // A partially updated bucket may be returned.
 func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUsageCache) (dataUsageCache, error) {
+	defer close(cache.Info.updates)
+
 	// Get bucket policy
 	// Check if the current bucket has a configured lifecycle policy
 	lc, err := globalLifecycleSys.Get(bucket)
@@ -524,7 +534,7 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	entries, err := readDir(fs.fsPath)
+	entries, err := readDirWithOpts(fs.fsPath, readDirOpts{count: -1, followDirSymlink: true})
 	if err != nil {
 		logger.LogIf(ctx, errDiskNotFound)
 		return nil, toObjectErr(errDiskNotFound)
@@ -798,83 +808,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		return nil, err
 	}
 
-	return objReaderFn(reader, h, opts.CheckPrecondFn, closeFn, rwPoolUnlocker, nsUnlocker)
-}
-
-// getObject - wrapper for GetObject
-func (fs *FSObjects) getObject(ctx context.Context, bucket, object string, offset int64, length int64, writer io.Writer, etag string, lock bool) (err error) {
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
-		return toObjectErr(err, bucket)
-	}
-
-	// Offset cannot be negative.
-	if offset < 0 {
-		logger.LogIf(ctx, errUnexpected, logger.Application)
-		return toObjectErr(errUnexpected, bucket, object)
-	}
-
-	// Writer cannot be nil.
-	if writer == nil {
-		logger.LogIf(ctx, errUnexpected, logger.Application)
-		return toObjectErr(errUnexpected, bucket, object)
-	}
-
-	// If its a directory request, we return an empty body.
-	if HasSuffix(object, SlashSeparator) {
-		_, err = writer.Write([]byte(""))
-		logger.LogIf(ctx, err)
-		return toObjectErr(err, bucket, object)
-	}
-
-	if bucket != minioMetaBucket {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-		if lock {
-			_, err = fs.rwPool.Open(fsMetaPath)
-			if err != nil && err != errFileNotFound {
-				logger.LogIf(ctx, err)
-				return toObjectErr(err, bucket, object)
-			}
-			defer fs.rwPool.Close(fsMetaPath)
-		}
-	}
-
-	if etag != "" && etag != defaultEtag {
-		objEtag, perr := fs.getObjectETag(ctx, bucket, object, lock)
-		if perr != nil {
-			return toObjectErr(perr, bucket, object)
-		}
-		if objEtag != etag {
-			logger.LogIf(ctx, InvalidETag{}, logger.Application)
-			return toObjectErr(InvalidETag{}, bucket, object)
-		}
-	}
-
-	// Read the object, doesn't exist returns an s3 compatible error.
-	fsObjPath := pathJoin(fs.fsPath, bucket, object)
-	reader, size, err := fsOpenFile(ctx, fsObjPath, offset)
-	if err != nil {
-		return toObjectErr(err, bucket, object)
-	}
-	defer reader.Close()
-
-	// For negative length we read everything.
-	if length < 0 {
-		length = size - offset
-	}
-
-	// Reply back invalid range if the input offset and length fall out of range.
-	if offset > size || offset+length > size {
-		err = InvalidRange{offset, length, size}
-		logger.LogIf(ctx, err, logger.Application)
-		return err
-	}
-
-	_, err = io.Copy(writer, io.LimitReader(reader, length))
-	// The writer will be closed incase of range queries, which will emit ErrClosedPipe.
-	if err == io.ErrClosedPipe {
-		err = nil
-	}
-	return toObjectErr(err, bucket, object)
+	return objReaderFn(reader, h, closeFn, rwPoolUnlocker, nsUnlocker)
 }
 
 // Create a new fs.json file, if the existing one is corrupt. Should happen very rarely.
@@ -1377,77 +1311,6 @@ func (fs *FSObjects) isObjectDir(bucket, prefix string) bool {
 	return len(entries) == 0
 }
 
-// getObjectETag is a helper function, which returns only the md5sum
-// of the file on the disk.
-func (fs *FSObjects) getObjectETag(ctx context.Context, bucket, entry string, lock bool) (string, error) {
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, entry, fs.metaJSONFile)
-
-	var reader io.Reader
-	var fi os.FileInfo
-	var size int64
-	if lock {
-		// Read `fs.json` to perhaps contend with
-		// parallel Put() operations.
-		rlk, err := fs.rwPool.Open(fsMetaPath)
-		// Ignore if `fs.json` is not available, this is true for pre-existing data.
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(ctx, err)
-			return "", toObjectErr(err, bucket, entry)
-		}
-
-		// If file is not found, we don't need to proceed forward.
-		if err == errFileNotFound {
-			return "", nil
-		}
-
-		// Read from fs metadata only if it exists.
-		defer fs.rwPool.Close(fsMetaPath)
-
-		// Fetch the size of the underlying file.
-		fi, err = rlk.LockedFile.Stat()
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return "", toObjectErr(err, bucket, entry)
-		}
-
-		size = fi.Size()
-		reader = io.NewSectionReader(rlk.LockedFile, 0, fi.Size())
-	} else {
-		var err error
-		reader, size, err = fsOpenFile(ctx, fsMetaPath, 0)
-		if err != nil {
-			return "", toObjectErr(err, bucket, entry)
-		}
-	}
-
-	// `fs.json` can be empty due to previously failed
-	// PutObject() transaction, if we arrive at such
-	// a situation we just ignore and continue.
-	if size == 0 {
-		return "", nil
-	}
-
-	fsMetaBuf, err := ioutil.ReadAll(reader)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return "", toObjectErr(err, bucket, entry)
-	}
-
-	var fsMeta fsMetaV1
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(fsMetaBuf, &fsMeta); err != nil {
-		return "", err
-	}
-
-	// Check if FS metadata is valid, if not return error.
-	if !isFSMetaValid(fsMeta.Version) {
-		logger.LogIf(ctx, errCorruptedFormat)
-		return "", toObjectErr(errCorruptedFormat, bucket, entry)
-	}
-
-	return extractETag(fsMeta.Meta), nil
-}
-
 // ListObjectVersions not implemented for FS mode.
 func (fs *FSObjects) ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (loi ListObjectVersionsInfo, e error) {
 	return loi, NotImplemented{}
@@ -1646,4 +1509,20 @@ func (fs *FSObjects) TransitionObject(ctx context.Context, bucket, object string
 // RestoreTransitionedObject - restore transitioned object content locally on this cluster.
 func (fs *FSObjects) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
 	return NotImplemented{}
+}
+
+// GetRawData returns raw file data to the callback.
+// Errors are ignored, only errors from the callback are returned.
+// For now only direct file paths are supported.
+func (fs *FSObjects) GetRawData(ctx context.Context, volume, file string, fn func(r io.Reader, host string, disk string, filename string, size int64, modtime time.Time) error) error {
+	f, err := os.Open(filepath.Join(fs.fsPath, volume, file))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		return nil
+	}
+	return fn(f, "fs", fs.fsUUID, file, st.Size(), st.ModTime())
 }

@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/minio/minio/cmd/config/storageclass"
+	"github.com/minio/minio/internal/config/storageclass"
 )
 
 func TestCheckPathLength(t *testing.T) {
@@ -966,11 +966,11 @@ func TestXLStorageDeleteFile(t *testing.T) {
 			expectedErr: nil,
 		},
 		// TestXLStorage case - 2.
-		// The file was deleted in the last  case, so Delete should fail.
+		// The file was deleted in the last  case, so Delete should not fail.
 		{
 			srcVol:      "success-vol",
 			srcPath:     "success-file",
-			expectedErr: errFileNotFound,
+			expectedErr: nil,
 		},
 		// TestXLStorage case - 3.
 		// TestXLStorage case with segment of the volume name > 255.

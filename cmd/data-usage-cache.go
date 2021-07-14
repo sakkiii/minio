@@ -32,9 +32,9 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/zstd"
 	"github.com/minio/madmin-go"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/bucket/lifecycle"
-	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/hash"
+	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -161,7 +161,8 @@ type dataUsageCacheInfo struct {
 	// optional updates channel.
 	// If set updates will be sent regularly to this channel.
 	// Will not be closed when returned.
-	updates chan<- dataUsageEntry `msg:"-"`
+	updates     chan<- dataUsageEntry `msg:"-"`
+	replication replicationConfig     `msg:"-"`
 }
 
 func (e *dataUsageEntry) addSizes(summary sizeSummary) {
@@ -218,12 +219,6 @@ func (h dataUsageHash) mod(cycle uint32, cycles uint32) bool {
 	return uint32(xxhash.Sum64String(string(h)))%cycles == cycle%cycles
 }
 
-// addChildString will add a child based on its name.
-// If it already exists it will not be added again.
-func (e *dataUsageEntry) addChildString(name string) {
-	e.addChild(hashPath(name))
-}
-
 // addChild will add a child based on its hash.
 // If it already exists it will not be added again.
 func (e *dataUsageEntry) addChild(hash dataUsageHash) {
@@ -234,6 +229,13 @@ func (e *dataUsageEntry) addChild(hash dataUsageHash) {
 		e.Children = make(dataUsageHashMap, 1)
 	}
 	e.Children[hash.Key()] = struct{}{}
+}
+
+// removeChild will remove a child based on its hash.
+func (e *dataUsageEntry) removeChild(hash dataUsageHash) {
+	if len(e.Children) > 0 {
+		delete(e.Children, hash.Key())
+	}
 }
 
 // find a path in the cache.
@@ -291,17 +293,6 @@ func (d *dataUsageCache) searchParent(h dataUsageHash) *dataUsageHash {
 	return nil
 }
 
-// Returns nil if not found.
-func (d *dataUsageCache) subCache(path string) dataUsageCache {
-	dst := dataUsageCache{Info: dataUsageCacheInfo{
-		Name:        path,
-		LastUpdate:  d.Info.LastUpdate,
-		BloomFilter: d.Info.BloomFilter,
-	}}
-	dst.copyWithChildren(d, dataUsageHash(hashPath(path).Key()), nil)
-	return dst
-}
-
 // deleteRecursive will delete an entry recursively, but not change its parent.
 func (d *dataUsageCache) deleteRecursive(h dataUsageHash) {
 	if existing, ok := d.Cache[h.String()]; ok {
@@ -311,37 +302,6 @@ func (d *dataUsageCache) deleteRecursive(h dataUsageHash) {
 			d.deleteRecursive(dataUsageHash(child))
 		}
 	}
-}
-
-// deleteChildren will delete any children, but not the entry itself.
-func (d *dataUsageCache) deleteChildren(h dataUsageHash) {
-	if existing, ok := d.Cache[h.String()]; ok {
-		for child := range existing.Children {
-			d.deleteRecursive(dataUsageHash(child))
-		}
-	}
-}
-
-// replaceRootChild will replace the child of root in d with the root of 'other'.
-func (d *dataUsageCache) replaceRootChild(other dataUsageCache) {
-	otherRoot := other.root()
-	if otherRoot == nil {
-		logger.LogIf(GlobalContext, errors.New("replaceRootChild: Source has no root"))
-		return
-	}
-	thisRoot := d.root()
-	if thisRoot == nil {
-		logger.LogIf(GlobalContext, errors.New("replaceRootChild: Root of current not found"))
-		return
-	}
-	thisRootHash := d.rootHash()
-	otherRootHash := other.rootHash()
-	if thisRootHash == otherRootHash {
-		logger.LogIf(GlobalContext, errors.New("replaceRootChild: Root of child matches root of destination"))
-		return
-	}
-	d.deleteRecursive(other.rootHash())
-	d.copyWithChildren(&other, other.rootHash(), &thisRootHash)
 }
 
 // keepBuckets will keep only the buckets specified specified by delete all others.
@@ -355,7 +315,8 @@ func (d *dataUsageCache) keepBuckets(b []BucketInfo) {
 
 // keepRootChildren will keep the root children specified by delete all others.
 func (d *dataUsageCache) keepRootChildren(list map[dataUsageHash]struct{}) {
-	if d.root() == nil {
+	root := d.root()
+	if root == nil {
 		return
 	}
 	rh := d.rootHash()
@@ -367,8 +328,17 @@ func (d *dataUsageCache) keepRootChildren(list map[dataUsageHash]struct{}) {
 		if _, ok := list[h]; !ok {
 			delete(d.Cache, k)
 			d.deleteRecursive(h)
+			root.removeChild(h)
 		}
 	}
+	// Clean up abandoned children.
+	for k := range root.Children {
+		h := dataUsageHash(k)
+		if _, ok := list[h]; !ok {
+			delete(root.Children, k)
+		}
+	}
+	d.Cache[rh.Key()] = *root
 }
 
 // dui converts the flattened version of the path to madmin.DataUsageInfo.
@@ -413,16 +383,6 @@ func (d *dataUsageCache) replace(path, parent string, e dataUsageEntry) {
 		p.addChild(hash)
 		d.Cache[phash.Key()] = p
 	}
-}
-
-// listCache will return all cache paths.
-func (d *dataUsageCache) listCache() []string {
-	dst := make([]string, 0, len(d.Cache))
-	for k := range d.Cache {
-		dst = append(dst, k)
-	}
-	sort.Strings(dst)
-	return dst
 }
 
 // replaceHashed add or replaces an entry to the cache based on its hash.
@@ -568,6 +528,18 @@ func (h dataUsageHash) String() string {
 // Key returns the key.
 func (h dataUsageHash) Key() string {
 	return string(h)
+}
+
+func (d *dataUsageCache) flattenChildrens(root dataUsageEntry) (m map[string]dataUsageEntry) {
+	m = make(map[string]dataUsageEntry)
+	for id := range root.Children {
+		e := d.Cache[id]
+		if len(e.Children) > 0 {
+			e = d.flatten(e)
+		}
+		m[id] = e
+	}
+	return m
 }
 
 // flatten all children of the root into the root element and return it.

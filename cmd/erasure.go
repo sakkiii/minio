@@ -28,12 +28,12 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/bpool"
-	"github.com/minio/minio/pkg/color"
-	"github.com/minio/minio/pkg/console"
-	"github.com/minio/minio/pkg/dsync"
-	"github.com/minio/minio/pkg/sync/errgroup"
+	"github.com/minio/minio/internal/bpool"
+	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/dsync"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/sync/errgroup"
+	"github.com/minio/pkg/console"
 )
 
 // OfflineDisk represents an unavailable disk.
@@ -73,6 +73,10 @@ type erasureObjects struct {
 
 	// Byte pools used for temporary i/o buffers.
 	bp *bpool.BytePoolCap
+
+	// Byte pools used for temporary i/o buffers,
+	// legacy objects.
+	bpOld *bpool.BytePoolCap
 
 	mrfOpCh chan partialOperation
 
@@ -480,11 +484,11 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 				updates := make(chan dataUsageEntry, 1)
 				var wg sync.WaitGroup
 				wg.Add(1)
-				go func() {
+				go func(name string) {
 					defer wg.Done()
 					for update := range updates {
 						bucketResults <- dataUsageEntryInfo{
-							Name:   cache.Info.Name,
+							Name:   name,
 							Parent: dataUsageRoot,
 							Entry:  update,
 						}
@@ -492,7 +496,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 							console.Debugln("bucket", bucket.Name, "got update", update)
 						}
 					}
-				}()
+				}(cache.Info.Name)
 
 				// Calc usage
 				before := cache.Info.LastUpdate

@@ -25,10 +25,10 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/color"
-	"github.com/minio/minio/pkg/console"
-	"github.com/minio/minio/pkg/wildcard"
+	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/wildcard"
 )
 
 const (
@@ -157,13 +157,6 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []BucketIn
 	buckets = append(buckets, BucketInfo{
 		Name: pathJoin(minioMetaBucket, minioConfigPrefix),
 	})
-
-	// Try to pro-actively heal backend-encrypted file.
-	if _, err := er.HealObject(ctx, minioMetaBucket, backendEncryptedFile, "", madmin.HealOpts{}); err != nil {
-		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			logger.LogIf(ctx, err)
-		}
-	}
 
 	// Heal all buckets with all objects
 	for _, bucket := range buckets {

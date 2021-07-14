@@ -26,11 +26,11 @@ import (
 	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/minio/cmd/config"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/auth"
-	iampolicy "github.com/minio/minio/pkg/iam/policy"
-	"github.com/minio/minio/pkg/kms"
+	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/kms"
+	"github.com/minio/minio/internal/logger"
+	iampolicy "github.com/minio/pkg/iam/policy"
 )
 
 // IAMObjectStore implements IAMStorageAPI
@@ -104,7 +104,7 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(ctx context.Context) error {
 
 			// 2. copy policy file to new location.
 			mp := newMappedPolicy(policyName)
-			userType := regularUser
+			userType := regUser
 			if err := iamOS.saveMappedPolicy(ctx, user, userType, false, mp); err != nil {
 				return err
 			}
@@ -279,7 +279,7 @@ func (iamOS *IAMObjectStore) loadUser(ctx context.Context, user string, userType
 func (iamOS *IAMObjectStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error {
 	var basePrefix string
 	switch userType {
-	case srvAccUser:
+	case svcUser:
 		basePrefix = iamConfigServiceAccountsPrefix
 	case stsUser:
 		basePrefix = iamConfigSTSPrefix
@@ -348,7 +348,7 @@ func (iamOS *IAMObjectStore) loadMappedPolicies(ctx context.Context, userType IA
 		basePath = iamConfigPolicyDBGroupsPrefix
 	} else {
 		switch userType {
-		case srvAccUser:
+		case svcUser:
 			basePath = iamConfigPolicyDBServiceAccountsPrefix
 		case stsUser:
 			basePath = iamConfigPolicyDBSTSUsersPrefix

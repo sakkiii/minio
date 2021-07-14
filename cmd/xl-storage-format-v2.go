@@ -29,9 +29,9 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/google/uuid"
-	xhttp "github.com/minio/minio/cmd/http"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/lifecycle"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -101,6 +101,11 @@ func isXL2V1Format(buf []byte) bool {
 // ``legacyObject``: This is the legacy object in xlV1 format, preserved until its overwritten
 //
 // The most recently updated element in the array is considered the latest version.
+
+// In addition to these we have a special kind called free-version. This is represented
+// using a delete-marker and MetaSys entries. It's used to track tiered content of a
+// deleted/overwritten version. This version is visible _only_to the scanner routine, for subsequent deletion.
+// This kind of tracking is necessary since a version's tiered content is deleted asynchronously.
 
 // Backend directory tree structure:
 // disk1/
@@ -211,6 +216,9 @@ type xlMetaV2Version struct {
 
 // Valid xl meta xlMetaV2Version is valid
 func (j xlMetaV2Version) Valid() bool {
+	if !j.Type.valid() {
+		return false
+	}
 	switch j.Type {
 	case LegacyType:
 		return j.ObjectV1 != nil &&
@@ -853,8 +861,17 @@ func (z *xlMetaV2) AddVersion(fi FileInfo) error {
 			ventry.ObjectV2.PartActualSizes[i] = fi.Parts[i].ActualSize
 		}
 
+		tierFVIDKey := ReservedMetadataPrefixLower + tierFVID
+		tierFVMarkerKey := ReservedMetadataPrefixLower + tierFVMarker
 		for k, v := range fi.Metadata {
 			if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+				// Skip tierFVID, tierFVMarker keys; it's used
+				// only for creating free-version.
+				switch k {
+				case tierFVIDKey, tierFVMarkerKey:
+					continue
+				}
+
 				ventry.ObjectV2.MetaSys[k] = []byte(v)
 			} else {
 				ventry.ObjectV2.MetaUser[k] = v
@@ -871,6 +888,9 @@ func (z *xlMetaV2) AddVersion(fi FileInfo) error {
 		}
 		if fi.TransitionedObjName != "" {
 			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionedObjectName] = []byte(fi.TransitionedObjName)
+		}
+		if fi.TransitionVersionID != "" {
+			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionedVersionID] = []byte(fi.TransitionVersionID)
 		}
 		if fi.TransitionTier != "" {
 			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionTier] = []byte(fi.TransitionTier)
@@ -936,6 +956,13 @@ func (j xlMetaV2DeleteMarker) ToFileInfo(volume, path string) (FileInfo, error) 
 			fi.VersionPurgeStatus = VersionPurgeStatusType(string(v))
 		}
 	}
+	if j.FreeVersion() {
+		fi.SetTierFreeVersion()
+		fi.TransitionTier = string(j.MetaSys[ReservedMetadataPrefixLower+TransitionTier])
+		fi.TransitionedObjName = string(j.MetaSys[ReservedMetadataPrefixLower+TransitionedObjectName])
+		fi.TransitionVersionID = string(j.MetaSys[ReservedMetadataPrefixLower+TransitionedVersionID])
+	}
+
 	return fi, nil
 }
 
@@ -1016,6 +1043,9 @@ func (j xlMetaV2Object) ToFileInfo(volume, path string) (FileInfo, error) {
 	}
 	if o, ok := j.MetaSys[ReservedMetadataPrefixLower+TransitionedObjectName]; ok {
 		fi.TransitionedObjName = string(o)
+	}
+	if rv, ok := j.MetaSys[ReservedMetadataPrefixLower+TransitionedVersionID]; ok {
+		fi.TransitionVersionID = string(rv)
 	}
 	if sc, ok := j.MetaSys[ReservedMetadataPrefixLower+TransitionTier]; ok {
 		fi.TransitionTier = string(sc)
@@ -1185,9 +1215,16 @@ func (z *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 				case fi.TransitionStatus == lifecycle.TransitionComplete:
 					z.Versions[i].ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionStatus] = []byte(fi.TransitionStatus)
 					z.Versions[i].ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionedObjectName] = []byte(fi.TransitionedObjName)
+					z.Versions[i].ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionedVersionID] = []byte(fi.TransitionVersionID)
 					z.Versions[i].ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionTier] = []byte(fi.TransitionTier)
 				default:
 					z.Versions = append(z.Versions[:i], z.Versions[i+1:]...)
+					// if uv has tiered content we add a
+					// free-version to track it for
+					// asynchronous deletion via scanner.
+					if freeVersion, toFree := version.ObjectV2.InitFreeVersion(fi); toFree {
+						z.Versions = append(z.Versions, freeVersion)
+					}
 				}
 
 				if fi.Deleted {
@@ -1301,6 +1338,17 @@ func (z xlMetaV2) ToFileInfo(volume, path, versionID string) (fi FileInfo, err e
 
 	orderedVersions := make([]xlMetaV2Version, len(z.Versions))
 	copy(orderedVersions, z.Versions)
+	n := 0
+	for _, version := range orderedVersions {
+		// skip listing free-version unless explicitly requested via versionID
+		if version.FreeVersion() && version.DeleteMarker.VersionID != uv {
+			continue
+		}
+		orderedVersions[n] = version
+		n++
+
+	}
+	orderedVersions = orderedVersions[:n]
 
 	sort.Slice(orderedVersions, func(i, j int) bool {
 		mtime1 := getModTimeFromVersion(orderedVersions[i])
@@ -1330,7 +1378,7 @@ func (z xlMetaV2) ToFileInfo(volume, path, versionID string) (fi FileInfo, err e
 	for i := range orderedVersions {
 		switch orderedVersions[i].Type {
 		case ObjectType:
-			if bytes.Equal(orderedVersions[i].ObjectV2.VersionID[:], uv[:]) {
+			if orderedVersions[i].ObjectV2.VersionID == uv {
 				fi, err = orderedVersions[i].ObjectV2.ToFileInfo(volume, path)
 				foundIndex = i
 				break
