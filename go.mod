@@ -41,12 +41,12 @@ require (
 	github.com/mattn/go-runewidth v0.0.13 // indirect
 	github.com/miekg/dns v1.1.35
 	github.com/minio/cli v1.22.0
-	github.com/minio/console v0.7.6-0.20210712213110-54dfcbd378d2
+	github.com/minio/console v0.7.6-0.20210720004637-bfedc1449791
 	github.com/minio/csvparser v1.0.0
 	github.com/minio/highwayhash v1.0.2
 	github.com/minio/kes v0.14.0
-	github.com/minio/madmin-go v1.0.15
-	github.com/minio/minio-go/v7 v7.0.13-0.20210706013812-337aa536abe2
+	github.com/minio/madmin-go v1.0.17
+	github.com/minio/minio-go/v7 v7.0.13-0.20210715203016-9e713532886e
 	github.com/minio/parquet-go v1.0.0
 	github.com/minio/pkg v1.0.10
 	github.com/minio/rpc v1.0.0
@@ -89,5 +89,3 @@ require (
 	google.golang.org/api v0.31.0
 	gopkg.in/yaml.v2 v2.4.0
 )
-
-replace google.golang.org/grpc => google.golang.org/grpc v1.29.1

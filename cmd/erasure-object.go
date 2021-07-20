@@ -267,7 +267,7 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 	// due to a bug in RenameData() the fi.Data is not niled leading to
 	// GetObject thinking that fi.Data is valid while fi.Size has
 	// changed already.
-	if _, ok := fi.Metadata[ReservedMetadataPrefixLower+"inline-data"]; ok {
+	if fi.InlineData() {
 		shardFileSize := erasure.ShardFileSize(fi.Size)
 		if shardFileSize >= 0 && shardFileSize >= smallFileThreshold {
 			for i := range metaArr {
@@ -816,7 +816,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	if len(inlineBuffers) > 0 {
 		// Set an additional header when data is inlined.
 		for index := range partsMetadata {
-			partsMetadata[index].Metadata[ReservedMetadataPrefixLower+"inline-data"] = "true"
+			partsMetadata[index].SetInlineData()
 		}
 	}
 
@@ -824,16 +824,6 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	if onlineDisks, err = renameData(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, bucket, object, writeQuorum); err != nil {
 		logger.LogIf(ctx, err)
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	// Whether a disk was initially or becomes offline
-	// during this upload, send it to the MRF list.
-	for i := 0; i < len(onlineDisks); i++ {
-		if onlineDisks[i] != nil && onlineDisks[i].IsOnline() {
-			continue
-		}
-		er.addPartial(bucket, object, fi.VersionID)
-		break
 	}
 
 	for i := 0; i < len(onlineDisks); i++ {
@@ -844,6 +834,17 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 			break
 		}
 	}
+
+	// Whether a disk was initially or becomes offline
+	// during this upload, send it to the MRF list.
+	for i := 0; i < len(onlineDisks); i++ {
+		if onlineDisks[i] != nil && onlineDisks[i].IsOnline() {
+			continue
+		}
+		er.addPartial(bucket, object, fi.VersionID, fi.Size)
+		break
+	}
+
 	online = countOnlineDisks(onlineDisks)
 
 	return fi.ToObjectInfo(bucket, object), nil
@@ -1029,7 +1030,7 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 
 			// all other direct versionId references we should
 			// ensure no dangling file is left over.
-			er.addPartial(bucket, version.Name, version.VersionID)
+			er.addPartial(bucket, version.Name, version.VersionID, -1)
 			break
 		}
 	}
@@ -1177,7 +1178,7 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		if disk != nil && disk.IsOnline() {
 			continue
 		}
-		er.addPartial(bucket, object, opts.VersionID)
+		er.addPartial(bucket, object, opts.VersionID, -1)
 		break
 	}
 
@@ -1192,11 +1193,15 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 
 // Send the successful but partial upload/delete, however ignore
 // if the channel is blocked by other items.
-func (er erasureObjects) addPartial(bucket, object, versionID string) {
-	select {
-	case er.mrfOpCh <- partialOperation{bucket: bucket, object: object, versionID: versionID}:
-	default:
-	}
+func (er erasureObjects) addPartial(bucket, object, versionID string, size int64) {
+	globalMRFState.addPartialOp(partialOperation{
+		bucket:    bucket,
+		object:    object,
+		versionID: versionID,
+		size:      size,
+		setIndex:  er.setIndex,
+		poolIndex: er.poolIndex,
+	})
 }
 
 func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
@@ -1388,6 +1393,12 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 			return toObjectErr(err, bucket, object)
 		}
 	}
+
+	// object content is small enough that it's inlined, skipping transition
+	if fi.InlineData() {
+		return nil
+	}
+
 	destObj, err := genTransitionObjName()
 	if err != nil {
 		return err
@@ -1421,7 +1432,7 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 		if disk != nil && disk.IsOnline() {
 			continue
 		}
-		er.addPartial(bucket, object, opts.VersionID)
+		er.addPartial(bucket, object, opts.VersionID, -1)
 		break
 	}
 	// Notify object deleted event.

@@ -200,30 +200,6 @@ func initConsoleServer() (*restapi.Server, error) {
 		restapi.Hostname = globalMinioConsoleHost
 	}
 
-	// subnet license refresh process
-	go func() {
-		// start refreshing subnet license after 5 seconds..
-		time.Sleep(time.Second * 5)
-
-		failedAttempts := 0
-		for {
-			if err := restapi.RefreshLicense(); err != nil {
-				failedAttempts++
-				// end license refresh after 3 consecutive failed attempts
-				if failedAttempts >= 3 {
-					return
-				}
-				// wait 5 minutes and retry again
-				time.Sleep(time.Minute * 5)
-				continue
-			}
-			// if license refreshed successfully reset the counter
-			failedAttempts = 0
-			// try to refresh license every 24 hrs
-			time.Sleep(time.Hour * 24)
-		}
-	}()
-
 	return server, nil
 }
 
@@ -419,14 +395,14 @@ func handleCommonEnvVars() {
 		if redirectURL := env.Get(config.EnvMinIOBrowserRedirectURL, ""); redirectURL != "" {
 			u, err := xnet.ParseHTTPURL(redirectURL)
 			if err != nil {
-				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT value in environment variable")
+				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT_URL value in environment variable")
 			}
 			// Look for if URL has invalid values and return error.
 			if !((u.Scheme == "http" || u.Scheme == "https") &&
 				(u.Path == "/" || u.Path == "") && u.Opaque == "" &&
 				!u.ForceQuery && u.RawQuery == "" && u.Fragment == "") {
 				err := fmt.Errorf("URL contains unexpected resources, expected URL to be of http(s)://minio.example.com format: %v", u)
-				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT value is environment variable")
+				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT_URL value is environment variable")
 			}
 			u.Path = "" // remove any path component such as `/`
 			globalBrowserRedirectURL = u
