@@ -180,8 +180,8 @@ func initBackgroundTransition(ctx context.Context, objectAPI ObjectLayer) {
 
 var errInvalidStorageClass = errors.New("invalid storage class")
 
-func validateTransitionTier(ctx context.Context, lfc *lifecycle.Lifecycle) error {
-	for _, rule := range lfc.Rules {
+func validateTransitionTier(lc *lifecycle.Lifecycle) error {
+	for _, rule := range lc.Rules {
 		if rule.Transition.StorageClass == "" {
 			continue
 		}
@@ -269,13 +269,13 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 }
 
 // generate an object name for transitioned object
-func genTransitionObjName() (string, error) {
+func genTransitionObjName(bucket string) (string, error) {
 	u, err := uuid.NewRandom()
 	if err != nil {
 		return "", err
 	}
 	us := u.String()
-	obj := fmt.Sprintf("%s/%s/%s", us[0:2], us[2:4], us)
+	obj := fmt.Sprintf("%s/%s/%s/%s/%s", globalDeploymentID, bucket, us[0:2], us[2:4], us)
 	return obj, nil
 }
 
@@ -288,15 +288,10 @@ func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo)
 	if err != nil {
 		return err
 	}
-	lcOpts := lifecycle.ObjectOpts{
-		Name:     oi.Name,
-		UserTags: oi.UserTags,
-	}
-	tierName := getLifeCycleTransitionTier(ctx, lc, oi.Bucket, lcOpts)
 	opts := ObjectOptions{
 		Transition: TransitionOptions{
 			Status: lifecycle.TransitionPending,
-			Tier:   tierName,
+			Tier:   lc.TransitionTier(oi.ToLifecycleOpts()),
 			ETag:   oi.ETag,
 		},
 		VersionID: oi.VersionID,
@@ -304,16 +299,6 @@ func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo)
 		MTime:     oi.ModTime,
 	}
 	return objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
-}
-
-// getLifeCycleTransitionTier returns storage class for transition target
-func getLifeCycleTransitionTier(ctx context.Context, lc *lifecycle.Lifecycle, bucket string, obj lifecycle.ObjectOpts) string {
-	for _, rule := range lc.FilterActionableRules(obj) {
-		if rule.Transition.StorageClass != "" {
-			return rule.Transition.StorageClass
-		}
-	}
-	return ""
 }
 
 // getTransitionedObjectReader returns a reader from the transitioned tier.
@@ -672,4 +657,22 @@ func isRestoredObjectOnDisk(meta map[string]string) (onDisk bool) {
 		}
 	}
 	return onDisk
+}
+
+// ToLifecycleOpts returns lifecycle.ObjectOpts value for oi.
+func (oi ObjectInfo) ToLifecycleOpts() lifecycle.ObjectOpts {
+	return lifecycle.ObjectOpts{
+		Name:                   oi.Name,
+		UserTags:               oi.UserTags,
+		VersionID:              oi.VersionID,
+		ModTime:                oi.ModTime,
+		IsLatest:               oi.IsLatest,
+		NumVersions:            oi.NumVersions,
+		DeleteMarker:           oi.DeleteMarker,
+		SuccessorModTime:       oi.SuccessorModTime,
+		RestoreOngoing:         oi.RestoreOngoing,
+		RestoreExpires:         oi.RestoreExpires,
+		TransitionStatus:       oi.TransitionStatus,
+		RemoteTiersImmediately: globalDebugRemoteTiersImmediately,
+	}
 }

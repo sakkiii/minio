@@ -21,8 +21,13 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	xhttp "github.com/minio/minio/internal/http"
 )
 
 func TestParseAndValidateLifecycleConfig(t *testing.T) {
@@ -427,5 +432,124 @@ func TestHasActiveRules(t *testing.T) {
 
 		})
 
+	}
+}
+
+func TestSetPredictionHeaders(t *testing.T) {
+	lc := Lifecycle{
+		Rules: []Rule{
+			{
+				ID:     "rule-1",
+				Status: "Enabled",
+				Expiration: Expiration{
+					Days: ExpirationDays(3),
+					set:  true,
+				},
+			},
+			{
+				ID:     "rule-2",
+				Status: "Enabled",
+				Transition: Transition{
+					Days:         TransitionDays(3),
+					StorageClass: "TIER-1",
+					set:          true,
+				},
+			},
+			{
+				ID:     "rule-3",
+				Status: "Enabled",
+				NoncurrentVersionTransition: NoncurrentVersionTransition{
+					NoncurrentDays: ExpirationDays(5),
+					StorageClass:   "TIER-2",
+					set:            true,
+				},
+			},
+		},
+	}
+
+	// current version
+	obj1 := ObjectOpts{
+		Name:     "obj1",
+		IsLatest: true,
+	}
+	// non-current version
+	obj2 := ObjectOpts{
+		Name: "obj2",
+	}
+
+	tests := []struct {
+		obj         ObjectOpts
+		expRuleID   int
+		transRuleID int
+	}{
+		{
+			obj:         obj1,
+			expRuleID:   0,
+			transRuleID: 1,
+		},
+		{
+			obj:         obj2,
+			expRuleID:   0,
+			transRuleID: 2,
+		},
+	}
+	for i, tc := range tests {
+		w := httptest.NewRecorder()
+		lc.SetPredictionHeaders(w, tc.obj)
+		if expHdrs, ok := w.Header()[xhttp.AmzExpiration]; ok && !strings.Contains(expHdrs[0], lc.Rules[tc.expRuleID].ID) {
+			t.Fatalf("Test %d: Expected %s header", i+1, xhttp.AmzExpiration)
+		}
+		if transHdrs, ok := w.Header()[xhttp.MinIOTransition]; ok {
+			if !strings.Contains(transHdrs[0], lc.Rules[tc.transRuleID].ID) {
+				t.Fatalf("Test %d: Expected %s header", i+1, xhttp.MinIOTransition)
+			}
+
+			if tc.obj.IsLatest {
+				if expectedDue, _ := lc.Rules[tc.transRuleID].Transition.NextDue(tc.obj); !strings.Contains(transHdrs[0], expectedDue.Format(http.TimeFormat)) {
+					t.Fatalf("Test %d: Expected transition time %s", i+1, expectedDue)
+				}
+			} else {
+				if expectedDue, _ := lc.Rules[tc.transRuleID].NoncurrentVersionTransition.NextDue(tc.obj); !strings.Contains(transHdrs[0], expectedDue.Format(http.TimeFormat)) {
+					t.Fatalf("Test %d: Expected transition time %s", i+1, expectedDue)
+				}
+			}
+		}
+	}
+}
+
+func TestTransitionTier(t *testing.T) {
+	lc := Lifecycle{
+		Rules: []Rule{
+			{
+				ID:     "rule-1",
+				Status: "Enabled",
+				Transition: Transition{
+					Days:         TransitionDays(3),
+					StorageClass: "TIER-1",
+				},
+			},
+			{
+				ID:     "rule-2",
+				Status: "Enabled",
+				NoncurrentVersionTransition: NoncurrentVersionTransition{
+					NoncurrentDays: ExpirationDays(3),
+					StorageClass:   "TIER-2",
+				},
+			},
+		},
+	}
+
+	obj1 := ObjectOpts{
+		Name:     "obj1",
+		IsLatest: true,
+	}
+	obj2 := ObjectOpts{
+		Name: "obj2",
+	}
+	if got := lc.TransitionTier(obj1); got != "TIER-1" {
+		t.Fatalf("Expected TIER-1 but got %s", got)
+	}
+	if got := lc.TransitionTier(obj2); got != "TIER-2" {
+		t.Fatalf("Expected TIER-2 but got %s", got)
 	}
 }

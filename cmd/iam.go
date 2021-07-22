@@ -650,12 +650,20 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
 		break
 	}
 
-	if globalOpenIDConfig.ProviderEnabled() {
+	// Set up polling for expired accounts and credentials purging.
+	switch {
+	case globalOpenIDConfig.ProviderEnabled():
 		go func() {
-			// Purge expired credentials
 			for {
 				time.Sleep(globalRefreshIAMInterval)
 				sys.purgeExpiredCredentialsForExternalSSO(ctx)
+			}
+		}()
+	case globalLDAPConfig.EnabledWithLookupBind():
+		go func() {
+			for {
+				time.Sleep(globalRefreshIAMInterval)
+				sys.purgeExpiredCredentialsForLDAP(ctx)
 			}
 		}()
 	}
@@ -1527,20 +1535,20 @@ func (sys *IAMSys) loadUserFromStore(accessKey string) {
 // by checking remote IDP if the relevant users are still active and present.
 func (sys *IAMSys) purgeExpiredCredentialsForExternalSSO(ctx context.Context) {
 	sys.store.lock()
-	parentUsersMap := make(map[string]auth.Credentials, len(sys.iamUsersMap))
+	parentUsersMap := make(map[string][]auth.Credentials, len(sys.iamUsersMap))
 	for _, cred := range sys.iamUsersMap {
 		if cred.IsServiceAccount() || cred.IsTemp() {
 			userid, err := parseOpenIDParentUser(cred.ParentUser)
 			if err == errSkipFile {
 				continue
 			}
-			parentUsersMap[userid] = cred
+			parentUsersMap[userid] = append(parentUsersMap[userid], cred)
 		}
 	}
 	sys.store.unlock()
 
 	expiredUsers := make([]auth.Credentials, 0, len(parentUsersMap))
-	for userid, cred := range parentUsersMap {
+	for userid, creds := range parentUsersMap {
 		u, err := globalOpenIDConfig.LookupUser(userid)
 		if err != nil {
 			logger.LogIf(GlobalContext, err)
@@ -1548,7 +1556,7 @@ func (sys *IAMSys) purgeExpiredCredentialsForExternalSSO(ctx context.Context) {
 		}
 		// Disabled parentUser purge the entries locally
 		if !u.Enabled {
-			expiredUsers = append(expiredUsers, cred)
+			expiredUsers = append(expiredUsers, creds...)
 		}
 	}
 
@@ -1567,6 +1575,54 @@ func (sys *IAMSys) purgeExpiredCredentialsForExternalSSO(ctx context.Context) {
 	for _, cred := range expiredUsers {
 		delete(sys.iamUsersMap, cred.AccessKey)
 		delete(sys.iamUserPolicyMap, cred.AccessKey)
+	}
+	sys.store.unlock()
+}
+
+// purgeExpiredCredentialsForLDAP - validates if local credentials are still
+// valid by checking LDAP server if the relevant users are still present.
+func (sys *IAMSys) purgeExpiredCredentialsForLDAP(ctx context.Context) {
+	sys.store.lock()
+	parentUsersMap := make(map[string][]auth.Credentials, len(sys.iamUsersMap))
+	parentUsers := make([]string, 0, len(sys.iamUsersMap))
+	for _, cred := range sys.iamUsersMap {
+		if cred.IsServiceAccount() || cred.IsTemp() {
+			if globalLDAPConfig.IsLDAPUserDN(cred.ParentUser) {
+				if _, ok := parentUsersMap[cred.ParentUser]; !ok {
+					parentUsers = append(parentUsers, cred.ParentUser)
+				}
+				parentUsersMap[cred.ParentUser] = append(parentUsersMap[cred.ParentUser], cred)
+			}
+		}
+	}
+	sys.store.unlock()
+
+	expiredUsers, err := globalLDAPConfig.GetNonExistentUserDNS(parentUsers)
+	if err != nil {
+		// Log and return on error - perhaps it'll work the next time.
+		logger.LogIf(GlobalContext, err)
+		return
+	}
+
+	for _, expiredUser := range expiredUsers {
+		for _, cred := range parentUsersMap[expiredUser] {
+			userType := regUser
+			if cred.IsServiceAccount() {
+				userType = svcUser
+			} else if cred.IsTemp() {
+				userType = stsUser
+			}
+			sys.store.deleteIAMConfig(ctx, getUserIdentityPath(cred.AccessKey, userType))
+			sys.store.deleteIAMConfig(ctx, getMappedPolicyPath(cred.AccessKey, userType, false))
+		}
+	}
+
+	sys.store.lock()
+	for _, user := range expiredUsers {
+		for _, cred := range parentUsersMap[user] {
+			delete(sys.iamUsersMap, cred.AccessKey)
+			delete(sys.iamUserPolicyMap, cred.AccessKey)
+		}
 	}
 	sys.store.unlock()
 }
@@ -2296,13 +2352,6 @@ func isAllowedBySessionPolicy(args iampolicy.Args) (hasSessionPolicy bool, isAll
 		// malformed/malicious requests.
 		return
 	}
-
-	policyBytes, err := base64.StdEncoding.DecodeString(spolicyStr)
-	if err != nil {
-		// Got a malformed base64 string
-		return
-	}
-	spolicyStr = string(policyBytes)
 
 	// Check if policy is parseable.
 	subPolicy, err := iampolicy.ParseConfig(bytes.NewReader([]byte(spolicyStr)))
