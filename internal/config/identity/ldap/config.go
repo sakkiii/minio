@@ -24,11 +24,14 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
 	ldap "github.com/go-ldap/ldap/v3"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/env"
 )
 
@@ -36,6 +39,9 @@ const (
 	defaultLDAPExpiry = time.Hour * 1
 
 	dnDelimiter = ";"
+
+	minLDAPExpiry time.Duration = 15 * time.Minute
+	maxLDAPExpiry time.Duration = 365 * 24 * time.Hour
 )
 
 // Config contains AD/LDAP server connectivity information.
@@ -416,8 +422,22 @@ func (l *Config) Connect() (ldapConn *ldap.Conn, err error) {
 }
 
 // GetExpiryDuration - return parsed expiry duration.
-func (l Config) GetExpiryDuration() time.Duration {
-	return l.stsExpiryDuration
+func (l Config) GetExpiryDuration(dsecs string) (time.Duration, error) {
+	if dsecs == "" {
+		return l.stsExpiryDuration, nil
+	}
+
+	d, err := strconv.Atoi(dsecs)
+	if err != nil {
+		return 0, auth.ErrInvalidDuration
+	}
+
+	dur := time.Duration(d) * time.Second
+
+	if dur < minLDAPExpiry || dur > maxLDAPExpiry {
+		return 0, auth.ErrInvalidDuration
+	}
+	return dur, nil
 }
 
 func (l Config) testConnection() error {
@@ -534,12 +554,16 @@ func Lookup(kvs config.KVS, rootCAs *x509.CertPool) (l Config, err error) {
 	l.ServerAddr = ldapServer
 	l.stsExpiryDuration = defaultLDAPExpiry
 	if v := env.Get(EnvSTSExpiry, kvs.Get(STSExpiry)); v != "" {
+		logger.Info("DEPRECATION WARNING: Support for configuring the default LDAP credentials expiry duration will be removed in a future release. Please use the `DurationSeconds` parameter in the LDAP STS API instead.")
 		expDur, err := time.ParseDuration(v)
 		if err != nil {
 			return l, errors.New("LDAP expiry time err:" + err.Error())
 		}
-		if expDur <= 0 {
-			return l, errors.New("LDAP expiry time has to be positive")
+		if expDur < minLDAPExpiry {
+			return l, fmt.Errorf("LDAP expiry time must be at least %s", minLDAPExpiry)
+		}
+		if expDur > maxLDAPExpiry {
+			return l, fmt.Errorf("LDAP expiry time may not exceed %s", maxLDAPExpiry)
 		}
 		l.STSExpiryDuration = v
 		l.stsExpiryDuration = expDur
