@@ -39,6 +39,7 @@ import (
 	"strings"
 	"time"
 
+	humanize "github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
 	"github.com/klauspost/compress/zip"
 	"github.com/minio/kes"
@@ -910,6 +911,52 @@ func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *
 	}
 }
 
+func (a adminAPIHandlers) SpeedtestHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SpeedtestHandler")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	if !globalIsErasure {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	sizeStr := r.URL.Query().Get(peerRESTSize)
+	durationStr := r.URL.Query().Get(peerRESTDuration)
+	concurrentStr := r.URL.Query().Get(peerRESTConcurrent)
+
+	size, err := strconv.Atoi(sizeStr)
+	if err != nil {
+		size = 64 * humanize.MiByte
+	}
+
+	concurrent, err := strconv.Atoi(concurrentStr)
+	if err != nil {
+		concurrent = 32
+	}
+
+	duration, err := time.ParseDuration(durationStr)
+	if err != nil {
+		duration = time.Second * 10
+	}
+
+	results := globalNotificationSys.Speedtest(ctx, size, concurrent, duration)
+
+	if err := json.NewEncoder(w).Encode(results); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	objectAPI.DeleteBucket(ctx, pathJoin(minioMetaSpeedTestBucket, minioMetaSpeedTestBucketPrefix), true)
+
+	w.(http.Flusher).Flush()
+}
+
 func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, action iampolicy.AdminAction) (ObjectLayer, auth.Credentials) {
 	var cred auth.Credentials
 	var adminAPIErr APIErrorCode
@@ -1652,6 +1699,22 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	getAndWriteSysErrors := func() {
+		if query.Get(string(madmin.HealthDataTypeSysErrors)) == "true" {
+			localSysErrors := madmin.GetSysErrors(deadlinedCtx, globalLocalNodeName)
+			anonymizeAddr(&localSysErrors)
+			healthInfo.Sys.SysErrs = append(healthInfo.Sys.SysErrs, localSysErrors)
+			partialWrite(healthInfo)
+
+			peerSysErrs := globalNotificationSys.GetSysErrors(deadlinedCtx)
+			for _, se := range peerSysErrs {
+				anonymizeAddr(&se)
+				healthInfo.Sys.SysErrs = append(healthInfo.Sys.SysErrs, se)
+			}
+			partialWrite(healthInfo)
+		}
+	}
+
 	anonymizeCmdLine := func(cmdLine string) string {
 		if !globalIsDistErasure {
 			// FS mode - single server - hard code to `server1`
@@ -1825,6 +1888,7 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		getAndWriteMinioConfig()
 		getAndWriteDrivePerfInfo()
 		getAndWriteNetPerfInfo()
+		getAndWriteSysErrors()
 
 		if query.Get("minioinfo") == "true" {
 			infoMessage := getServerInfo(ctx, r)
@@ -2252,12 +2316,13 @@ func createHostAnonymizerForFSMode() map[string]string {
 
 	apiEndpoints := getAPIEndpoints()
 	for _, ep := range apiEndpoints {
-		if len(ep) > 0 {
-			if url, err := xnet.ParseHTTPURL(ep); err == nil {
-				// In FS mode the drive names don't include the host.
-				// So mapping just the host should be sufficient.
-				hostAnonymizer[url.Host] = "server1"
-			}
+		if len(ep) == 0 {
+			continue
+		}
+		if url, err := xnet.ParseHTTPURL(ep); err == nil {
+			// In FS mode the drive names don't include the host.
+			// So mapping just the host should be sufficient.
+			hostAnonymizer[url.Host] = "server1"
 		}
 	}
 	return hostAnonymizer

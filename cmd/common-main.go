@@ -44,6 +44,7 @@ import (
 	"github.com/minio/console/restapi"
 	"github.com/minio/console/restapi/operations"
 	"github.com/minio/kes"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
@@ -70,7 +71,7 @@ func init() {
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsKubernetesReplicaSet() || IsPCFTile() {
+	if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
 		// 30 seconds matches the orchestrator DNS TTLs, have
 		// a 5 second timeout to lookup from DNS servers.
 		globalDNSCache = xhttp.NewDNSCache(30*time.Second, 5*time.Second, logger.LogOnceIf)
@@ -104,6 +105,10 @@ func init() {
 			},
 		},
 	}
+
+	// All minio-go API operations shall be performed only once,
+	// another way to look at this is we are turning off retries.
+	minio.MaxRetry = 1
 }
 
 const consolePrefix = "CONSOLE_"
@@ -111,10 +116,11 @@ const consolePrefix = "CONSOLE_"
 func minioConfigToConsoleFeatures() {
 	os.Setenv("CONSOLE_PBKDF_SALT", globalDeploymentID)
 	os.Setenv("CONSOLE_PBKDF_PASSPHRASE", globalDeploymentID)
-	if globalMinioEndpoint == "" {
-		logger.Fatal(errInvalidArgument, "Unable to start console service MinIO Endpoint is empty")
+	if globalMinioEndpoint != "" {
+		os.Setenv("CONSOLE_MINIO_SERVER", globalMinioEndpoint)
+	} else {
+		os.Setenv("CONSOLE_MINIO_SERVER", getAPIEndpoints()[0])
 	}
-	os.Setenv("CONSOLE_MINIO_SERVER", globalMinioEndpoint)
 	if value := env.Get("MINIO_LOG_QUERY_URL", ""); value != "" {
 		os.Setenv("CONSOLE_LOG_QUERY_URL", value)
 		if value := env.Get("MINIO_LOG_QUERY_AUTH_TOKEN", ""); value != "" {
@@ -172,14 +178,16 @@ func initConsoleServer() (*restapi.Server, error) {
 		return nil, err
 	}
 
+	noLog := func(string, ...interface{}) {
+		// nothing to log
+	}
+
 	// Initialize MinIO loggers
-	restapi.LogInfo = logger.Info
-	restapi.LogError = logger.Error
+	restapi.LogInfo = noLog
+	restapi.LogError = noLog
 
 	api := operations.NewConsoleAPI(swaggerSpec)
-	api.Logger = func(_ string, _ ...interface{}) {
-		// nothing to log.
-	}
+	api.Logger = noLog
 
 	server := restapi.NewServer(api)
 	// register all APIs
@@ -412,7 +420,7 @@ func handleCommonEnvVars() {
 		}
 	}
 
-	if serverURL := env.Get(config.EnvMinIOServerURL, globalEndpoints.Localhost()); serverURL != "" {
+	if serverURL := env.Get(config.EnvMinIOServerURL, ""); serverURL != "" {
 		u, err := xnet.ParseHTTPURL(serverURL)
 		if err != nil {
 			logger.Fatal(err, "Invalid MINIO_SERVER_URL value in environment variable")

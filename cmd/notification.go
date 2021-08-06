@@ -1066,6 +1066,36 @@ func (sys *NotificationSys) GetOSInfo(ctx context.Context) []madmin.OSInfo {
 	return reply
 }
 
+// GetSysErrors - Memory information
+func (sys *NotificationSys) GetSysErrors(ctx context.Context) []madmin.SysErrors {
+	reply := make([]madmin.SysErrors, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].GetSysErrors(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
 // GetMemInfo - Memory information
 func (sys *NotificationSys) GetMemInfo(ctx context.Context) []madmin.MemInfo {
 	reply := make([]madmin.MemInfo, len(sys.peerClients))
@@ -1426,4 +1456,56 @@ func (sys *NotificationSys) GetClusterMetrics(ctx context.Context) chan Metric {
 		close(ch)
 	}(&wg, ch)
 	return ch
+}
+
+// Speedtest run GET/PUT tests at input concurrency for requested object size,
+// optionally you can extend the tests longer with time.Duration.
+func (sys *NotificationSys) Speedtest(ctx context.Context, size int, concurrent int, duration time.Duration) []madmin.SpeedtestResult {
+	results := make([]madmin.SpeedtestResult, len(sys.allPeerClients))
+
+	scheme := "http"
+	if globalIsTLS {
+		scheme = "https"
+	}
+
+	var wg sync.WaitGroup
+	for index := range sys.peerClients {
+		if sys.peerClients[index] == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			r, err := sys.peerClients[index].Speedtest(ctx, size, concurrent, duration)
+			u := &url.URL{
+				Scheme: scheme,
+				Host:   sys.peerClients[index].host.String(),
+			}
+			results[index].Endpoint = u.String()
+			results[index].Err = err
+			if err == nil {
+				results[index].Uploads = r.Uploads
+				results[index].Downloads = r.Downloads
+			}
+		}(index)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r, err := selfSpeedtest(ctx, size, concurrent, duration)
+		u := &url.URL{
+			Scheme: scheme,
+			Host:   globalLocalNodeName,
+		}
+		results[len(results)-1].Endpoint = u.String()
+		results[len(results)-1].Err = err
+		if err == nil {
+			results[len(results)-1].Uploads = r.Uploads
+			results[len(results)-1].Downloads = r.Downloads
+		}
+	}()
+	wg.Wait()
+
+	return results
 }

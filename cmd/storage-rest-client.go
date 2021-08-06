@@ -250,7 +250,7 @@ func (client *storageRESTClient) NSScanner(ctx context.Context, cache dataUsageC
 	if err == io.EOF {
 		err = nil
 	}
-	return cache, err
+	return newCache, err
 }
 
 func (client *storageRESTClient) GetDiskID() (string, error) {
@@ -430,16 +430,6 @@ func (client *storageRESTClient) WriteAll(ctx context.Context, volume string, pa
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
 	respBody, err := client.call(ctx, storageRESTMethodWriteAll, values, bytes.NewBuffer(b), int64(len(b)))
-	defer xhttp.DrainBody(respBody)
-	return err
-}
-
-// CheckFile - stat a file metadata.
-func (client *storageRESTClient) CheckFile(ctx context.Context, volume string, path string) error {
-	values := make(url.Values)
-	values.Set(storageRESTVolume, volume)
-	values.Set(storageRESTFilePath, path)
-	respBody, err := client.call(ctx, storageRESTMethodCheckFile, values, nil, -1)
 	defer xhttp.DrainBody(respBody)
 	return err
 }

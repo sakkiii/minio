@@ -34,6 +34,7 @@ const (
 	peerRESTMethodOsInfo                   = "/osinfo"
 	peerRESTMethodMemInfo                  = "/meminfo"
 	peerRESTMethodProcInfo                 = "/procinfo"
+	peerRESTMethodSysErrors                = "/syserrors"
 	peerRESTMethodDispatchNetInfo          = "/dispatchnetinfo"
 	peerRESTMethodDeleteBucketMetadata     = "/deletebucketmetadata"
 	peerRESTMethodLoadBucketMetadata       = "/loadbucketmetadata"
@@ -62,6 +63,7 @@ const (
 	peerRESTMethodUpdateMetacacheListing   = "/updatemetacache"
 	peerRESTMethodGetPeerMetrics           = "/peermetrics"
 	peerRESTMethodLoadTransitionTierConfig = "/loadtransitiontierconfig"
+	peerRESTMethodSpeedtest                = "/speedtest"
 )
 
 const (
@@ -81,6 +83,9 @@ const (
 	peerRESTTraceS3        = "s3"
 	peerRESTTraceOS        = "os"
 	peerRESTTraceThreshold = "threshold"
+	peerRESTSize           = "size"
+	peerRESTConcurrent     = "concurrent"
+	peerRESTDuration       = "duration"
 
 	peerRESTListenBucket = "bucket"
 	peerRESTListenPrefix = "prefix"

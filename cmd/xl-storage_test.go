@@ -30,8 +30,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-
-	"github.com/minio/minio/internal/config/storageclass"
 )
 
 func TestCheckPathLength(t *testing.T) {
@@ -1152,10 +1150,6 @@ func TestXLStorageReadFile(t *testing.T) {
 	}
 
 	for l := 0; l < 2; l++ {
-		// 1st loop tests with dma=write, 2nd loop tests with dma=read-write.
-		if l == 1 {
-			globalStorageClass.DMA = storageclass.DMAReadWrite
-		}
 		// Following block validates all ReadFile test cases.
 		for i, testCase := range testCases {
 			var n int64
@@ -1212,9 +1206,6 @@ func TestXLStorageReadFile(t *testing.T) {
 			}
 		}
 	}
-
-	// Reset the flag.
-	globalStorageClass.DMA = storageclass.DMAWrite
 
 	// TestXLStorage for permission denied.
 	if runtime.GOOS != globalWindowsOSName {
@@ -1637,8 +1628,8 @@ func TestXLStorageRenameFile(t *testing.T) {
 	}
 }
 
-// TestXLStorage xlStorage.CheckFile()
-func TestXLStorageCheckFile(t *testing.T) {
+// TestXLStorage xlStorage.StatInfoFile()
+func TestXLStorageStatInfoFile(t *testing.T) {
 	// create xlStorage test setup
 	xlStorage, path, err := newXLStorageTestSetup()
 	if err != nil {
@@ -1708,19 +1699,20 @@ func TestXLStorageCheckFile(t *testing.T) {
 		{
 			srcVol:      "non-existent-vol",
 			srcPath:     "success-file",
-			expectedErr: errPathNotFound,
+			expectedErr: errVolumeNotFound,
 		},
 		// TestXLStorage case - 7.
 		// TestXLStorage case with file with directory.
 		{
 			srcVol:      "success-vol",
 			srcPath:     "path/to",
-			expectedErr: errFileNotFound,
+			expectedErr: nil,
 		},
 	}
 
 	for i, testCase := range testCases {
-		if err := xlStorage.CheckFile(context.Background(), testCase.srcVol, testCase.srcPath); err != testCase.expectedErr {
+		_, err := xlStorage.StatInfoFile(context.Background(), testCase.srcVol, testCase.srcPath+"/"+xlStorageFormatFile)
+		if err != testCase.expectedErr {
 			t.Errorf("TestXLStorage case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
 	}

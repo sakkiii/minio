@@ -442,7 +442,9 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	}
 
 	// if missing metadata can be reconstructed, attempt to reconstruct.
-	if missingBlocks > 0 && missingBlocks < readQuorum {
+	// additionally do not heal delete markers inline, let them be
+	// healed upon regular heal process.
+	if !fi.Deleted && missingBlocks > 0 && missingBlocks < readQuorum {
 		if _, healing := er.getOnlineDisksWithHealing(); !healing {
 			go healObject(bucket, object, fi.VersionID, madmin.HealNormalScan)
 		}
@@ -656,13 +658,6 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	if data.Size() < -1 {
 		logger.LogIf(ctx, errInvalidArgument, logger.Application)
 		return ObjectInfo{}, toObjectErr(errInvalidArgument)
-	}
-
-	// Check if an object is present as one of the parent dir.
-	// -- FIXME. (needs a new kind of lock).
-	// -- FIXME (this also causes performance issue when disks are down).
-	if opts.ParentIsObject != nil && opts.ParentIsObject(ctx, bucket, path.Dir(object)) {
-		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
 	// Initialize parts metadata
@@ -1394,11 +1389,6 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 		}
 	}
 
-	// object content is small enough that it's inlined, skipping transition
-	if fi.InlineData() {
-		return nil
-	}
-
 	destObj, err := genTransitionObjName(bucket)
 	if err != nil {
 		return err
@@ -1435,16 +1425,15 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 		er.addPartial(bucket, object, opts.VersionID, -1)
 		break
 	}
-	// Notify object deleted event.
+
+	objInfo := fi.ToObjectInfo(bucket, object)
 	sendEvent(eventArgs{
 		EventName:  eventName,
 		BucketName: bucket,
-		Object: ObjectInfo{
-			Name:      object,
-			VersionID: opts.VersionID,
-		},
-		Host: "Internal: [ILM-Transition]",
+		Object:     objInfo,
+		Host:       "Internal: [ILM-Transition]",
 	})
+	auditLogLifecycle(ctx, objInfo, ILMTransition)
 	return err
 }
 
