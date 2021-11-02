@@ -20,9 +20,11 @@ package cmd
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
@@ -265,6 +267,16 @@ const (
 	ErrAdminCredentialsMismatch
 	ErrInsecureClientRequest
 	ErrObjectTampered
+
+	// Site-Replication errors
+	ErrSiteReplicationInvalidRequest
+	ErrSiteReplicationPeerResp
+	ErrSiteReplicationBackendIssue
+	ErrSiteReplicationServiceAccountError
+	ErrSiteReplicationBucketConfigError
+	ErrSiteReplicationBucketMetaError
+	ErrSiteReplicationIAMError
+
 	// Bucket Quota error codes
 	ErrAdminBucketQuotaExceeded
 	ErrAdminNoSuchQuotaConfiguration
@@ -442,7 +454,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrInvalidMaxParts: {
 		Code:           "InvalidArgument",
-		Description:    "Argument max-parts must be an integer between 0 and 2147483647",
+		Description:    "Part number must be an integer between 1 and 10000, inclusive",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidPartNumberMarker: {
@@ -1267,6 +1279,43 @@ var errorCodes = errorCodeMap{
 		Description:    errObjectTampered.Error(),
 		HTTPStatusCode: http.StatusPartialContent,
 	},
+
+	ErrSiteReplicationInvalidRequest: {
+		Code:           "XMinioSiteReplicationInvalidRequest",
+		Description:    "Invalid site-replication request",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSiteReplicationPeerResp: {
+		Code:           "XMinioSiteReplicationPeerResp",
+		Description:    "Error received when contacting a peer site",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationBackendIssue: {
+		Code:           "XMinioSiteReplicationBackendIssue",
+		Description:    "Error when requesting object layer backend",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationServiceAccountError: {
+		Code:           "XMinioSiteReplicationServiceAccountError",
+		Description:    "Site replication related service account error",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationBucketConfigError: {
+		Code:           "XMinioSiteReplicationBucketConfigError",
+		Description:    "Error while configuring replication on a bucket",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationBucketMetaError: {
+		Code:           "XMinioSiteReplicationBucketMetaError",
+		Description:    "Error while replicating bucket metadata",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationIAMError: {
+		Code:           "XMinioSiteReplicationIAMError",
+		Description:    "Error while replicating an IAM item",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+
 	ErrMaximumExpires: {
 		Code:           "AuthorizationQueryParametersError",
 		Description:    "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must be less than 604800 seconds",
@@ -1785,12 +1834,10 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 
 	// Only return ErrClientDisconnected if the provided context is actually canceled.
 	// This way downstream context.Canceled will still report ErrOperationTimedOut
-	select {
-	case <-ctx.Done():
+	if contextCanceled(ctx) {
 		if ctx.Err() == context.Canceled {
 			return ErrClientDisconnected
 		}
-	default:
 	}
 
 	switch err {
@@ -1909,6 +1956,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrNoSuchKey
 	case MethodNotAllowed:
 		apiErr = ErrMethodNotAllowed
+	case ObjectLocked:
+		apiErr = ErrObjectLocked
 	case InvalidVersionID:
 		apiErr = ErrInvalidVersionID
 	case VersionNotFound:
@@ -1965,8 +2014,6 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrReplicationConfigurationNotFoundError
 	case BucketRemoteDestinationNotFound:
 		apiErr = ErrRemoteDestinationNotFoundError
-	case BucketReplicationDestinationMissingLock:
-		apiErr = ErrReplicationDestinationMissingLock
 	case BucketRemoteTargetNotFound:
 		apiErr = ErrRemoteTargetNotFoundError
 	case BucketRemoteConnectionErr:
@@ -2177,10 +2224,30 @@ func toAPIError(ctx context.Context, err error) APIError {
 			}
 			// Add more Gateway SDKs here if any in future.
 		default:
-			apiErr = APIError{
-				Code:           apiErr.Code,
-				Description:    fmt.Sprintf("%s: cause(%v)", apiErr.Description, err),
-				HTTPStatusCode: apiErr.HTTPStatusCode,
+			if errors.Is(err, errMalformedEncoding) {
+				apiErr = APIError{
+					Code:           "BadRequest",
+					Description:    err.Error(),
+					HTTPStatusCode: http.StatusBadRequest,
+				}
+			} else if errors.Is(err, errChunkTooBig) {
+				apiErr = APIError{
+					Code:           "BadRequest",
+					Description:    err.Error(),
+					HTTPStatusCode: http.StatusBadRequest,
+				}
+			} else if errors.Is(err, strconv.ErrRange) {
+				apiErr = APIError{
+					Code:           "BadRequest",
+					Description:    err.Error(),
+					HTTPStatusCode: http.StatusBadRequest,
+				}
+			} else {
+				apiErr = APIError{
+					Code:           apiErr.Code,
+					Description:    fmt.Sprintf("%s: cause(%v)", apiErr.Description, err),
+					HTTPStatusCode: apiErr.HTTPStatusCode,
+				}
 			}
 		}
 	}

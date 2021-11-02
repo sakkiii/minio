@@ -122,7 +122,7 @@ func (er erasureObjects) renameAll(ctx context.Context, bucket, prefix string) {
 		wg.Add(1)
 		go func(disk StorageAPI) {
 			defer wg.Done()
-			disk.RenameFile(ctx, bucket, prefix, minioMetaTmpBucket, mustGetUUID())
+			disk.RenameFile(ctx, bucket, prefix, minioMetaTmpDeletedBucket, mustGetUUID())
 		}(disk)
 	}
 	wg.Wait()
@@ -347,8 +347,9 @@ func (er erasureObjects) newMultipartUpload(ctx context.Context, bucket string, 
 	// Fill all the necessary metadata.
 	// Update `xl.meta` content on each disks.
 	for index := range partsMetadata {
-		partsMetadata[index].Metadata = opts.UserDefined
+		partsMetadata[index].Fresh = true
 		partsMetadata[index].ModTime = modTime
+		partsMetadata[index].Metadata = opts.UserDefined
 	}
 
 	uploadID := mustGetUUID()
@@ -782,9 +783,6 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		return oi, toObjectErr(err, bucket, object, uploadID)
 	}
 
-	// Calculate s3 compatible md5sum for complete multipart.
-	s3MD5 := getCompleteMultipartMD5(parts)
-
 	uploadIDPath := er.getUploadIDDir(bucket, object, uploadID)
 
 	storageDisks := er.getDisks()
@@ -881,9 +879,9 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 	}
 
 	// Save successfully calculated md5sum.
-	fi.Metadata["etag"] = s3MD5
-	if opts.UserDefined["etag"] != "" { // preserve ETag if set
-		fi.Metadata["etag"] = opts.UserDefined["etag"]
+	fi.Metadata["etag"] = opts.UserDefined["etag"]
+	if fi.Metadata["etag"] == "" {
+		fi.Metadata["etag"] = getCompleteMultipartMD5(parts)
 	}
 
 	// Save the consolidated actual size.
@@ -951,6 +949,9 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 			break
 		}
 	}
+
+	// we are adding a new version to this object under the namespace lock, so this is the latest version.
+	fi.IsLatest = true
 
 	// Success, return object info.
 	return fi.ToObjectInfo(bucket, object), nil

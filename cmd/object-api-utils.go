@@ -263,7 +263,7 @@ func cleanMetadata(metadata map[string]string) map[string]string {
 	// Remove STANDARD StorageClass
 	metadata = removeStandardStorageClass(metadata)
 	// Clean meta etag keys 'md5Sum', 'etag', "expires", "x-amz-tagging".
-	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified")
+	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified", VersionPurgeStatusKey)
 }
 
 // Filter X-Amz-Storage-Class field only if it is set to STANDARD.
@@ -290,10 +290,10 @@ func cleanMetadataKeys(metadata map[string]string, keyNames ...string) map[strin
 
 // Extracts etag value from the metadata.
 func extractETag(metadata map[string]string) string {
-	// md5Sum tag is kept for backward compatibility.
-	etag, ok := metadata["md5Sum"]
+	etag, ok := metadata["etag"]
 	if !ok {
-		etag = metadata["etag"]
+		// md5Sum tag is kept for backward compatibility.
+		etag = metadata["md5Sum"]
 	}
 	// Success.
 	return etag
@@ -884,6 +884,16 @@ func CleanMinioInternalMetadataKeys(metadata map[string]string) map[string]strin
 	return newMeta
 }
 
+// compressOpts are the options for writing compressed data.
+var compressOpts []s2.WriterOption
+
+func init() {
+	if runtime.GOARCH == "amd64" {
+		// On amd64 we have assembly and can use stronger compression.
+		compressOpts = append(compressOpts, s2.WriterBetterCompression())
+	}
+}
+
 // newS2CompressReader will read data from r, compress it and return the compressed data as a Reader.
 // Use Close to ensure resources are released on incomplete streams.
 //
@@ -894,7 +904,7 @@ func newS2CompressReader(r io.Reader, on int64) io.ReadCloser {
 	pr, pw := io.Pipe()
 	// Copy input to compressor
 	go func() {
-		comp := s2.NewWriter(pw)
+		comp := s2.NewWriter(pw, compressOpts...)
 		cn, err := io.Copy(comp, r)
 		if err != nil {
 			comp.Close()

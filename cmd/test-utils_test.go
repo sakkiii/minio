@@ -45,6 +45,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"reflect"
 	"sort"
 	"strconv"
@@ -62,7 +63,6 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/bucket/policy"
@@ -104,8 +104,6 @@ func TestMain(m *testing.M) {
 
 	// Initialize globalConsoleSys system
 	globalConsoleSys = NewConsoleLogger(context.Background())
-
-	globalDNSCache = xhttp.NewDNSCache(3*time.Second, 10*time.Second, logger.LogOnceIf)
 
 	globalInternodeTransport = newInternodeHTTPTransport(nil, rest.DefaultTimeout)()
 
@@ -222,7 +220,10 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	newTestConfig(globalMinioDefaultRegion, obj)
+
+	newAllSubsystems()
 	return obj
 }
 
@@ -333,7 +334,7 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 	}
 
 	// Run TestServer.
-	testServer.Server = httptest.NewUnstartedServer(criticalErrorHandler{corsHandler(httpHandler)})
+	testServer.Server = httptest.NewUnstartedServer(setCriticalErrorHandler(corsHandler(httpHandler)))
 
 	globalObjLayerMutex.Lock()
 	globalObjectAPI = objLayer
@@ -349,7 +350,7 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 
 	initAllSubsystems(ctx, objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 	return testServer
 }
@@ -1469,7 +1470,7 @@ func newTestObjectLayer(ctx context.Context, endpointServerPools EndpointServerP
 
 	initAllSubsystems(ctx, z)
 
-	globalIAMSys.InitStore(z)
+	globalIAMSys.InitStore(z, globalEtcdClient)
 
 	return z, nil
 }
@@ -1517,7 +1518,7 @@ func initAPIHandlerTest(obj ObjectLayer, endpoints []string) (string, http.Handl
 
 	initAllSubsystems(context.Background(), obj)
 
-	globalIAMSys.InitStore(obj)
+	globalIAMSys.InitStore(obj, globalEtcdClient)
 
 	// get random bucket name.
 	bucketName := getRandomBucketName()
@@ -1648,12 +1649,8 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 			t.Fatal(failTestStr(unknownSignTestStr, "error response failed to parse error XML"))
 		}
 
-		if actualError.BucketName != bucketName {
-			t.Fatal(failTestStr(unknownSignTestStr, "error response bucket name differs from expected value"))
-		}
-
-		if actualError.Key != objectName {
-			t.Fatal(failTestStr(unknownSignTestStr, "error response object name differs from expected value"))
+		if path.Clean(actualError.Resource) != pathJoin(SlashSeparator, bucketName, SlashSeparator, objectName) {
+			t.Fatal(failTestStr(unknownSignTestStr, "error response resource differs from expected value"))
 		}
 	}
 
@@ -1811,7 +1808,7 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 
 	initAllSubsystems(ctx, objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.InitStore(objLayer, globalEtcdClient)
 
 	// Executing the object layer tests for single node setup.
 	objTest(objLayer, FSTestStr, t)
@@ -1832,7 +1829,7 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 
 	initAllSubsystems(ctx, objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.InitStore(objLayer, globalEtcdClient)
 
 	defer removeRoots(append(fsDirs, fsDir))
 	// Executing the object layer tests for Erasure.
@@ -2035,13 +2032,15 @@ func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFuncti
 func initTestAPIEndPoints(objLayer ObjectLayer, apiFunctions []string) http.Handler {
 	// initialize a new mux router.
 	// goriilla/mux is the library used to register all the routes and handle them.
-	muxRouter := mux.NewRouter().SkipClean(true)
+	muxRouter := mux.NewRouter().SkipClean(true).UseEncodedPath()
 	if len(apiFunctions) > 0 {
 		// Iterate the list of API functions requested for and register them in mux HTTP handler.
 		registerAPIFunctions(muxRouter, objLayer, apiFunctions...)
+		muxRouter.Use(globalHandlers...)
 		return muxRouter
 	}
 	registerAPIRouter(muxRouter)
+	muxRouter.Use(globalHandlers...)
 	return muxRouter
 }
 

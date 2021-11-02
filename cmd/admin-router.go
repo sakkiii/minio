@@ -24,6 +24,7 @@ import (
 	"github.com/klauspost/compress/gzhttp"
 	"github.com/klauspost/compress/gzip"
 	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/logger"
 )
 
 const (
@@ -48,16 +49,12 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminAPIVersionPrefix,
 	}
 
-	gz := func(h http.HandlerFunc) http.HandlerFunc {
-		return h
+	gz, err := gzhttp.NewWrapper(gzhttp.MinSize(1000), gzhttp.CompressionLevel(gzip.BestSpeed))
+	if err != nil {
+		// Static params, so this is very unlikely.
+		logger.Fatal(err, "Unable to initialize server")
 	}
 
-	wrapper, err := gzhttp.NewWrapper(gzhttp.MinSize(1000), gzhttp.CompressionLevel(gzip.BestSpeed))
-	if err == nil {
-		gz = func(h http.HandlerFunc) http.HandlerFunc {
-			return wrapper(h).(http.HandlerFunc)
-		}
-	}
 	for _, adminVersion := range adminVersions {
 		// Restart and stop MinIO service.
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/service").HandlerFunc(gz(httpTraceAll(adminAPI.ServiceHandler))).Queries("action", "{action:.*}")
@@ -194,6 +191,19 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.AddTierHandler)))
 			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.EditTierHandler)))
 			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListTierHandler)))
+
+			// Tier stats
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier-stats").HandlerFunc(gz(httpTraceHdrs(adminAPI.TierStatsHandler)))
+
+			// Cluster Replication APIs
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/add").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationAdd)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/disable").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationDisable)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/info").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationInfo)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/join").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRInternalJoin)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/site-replication/peer/bucket-ops").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRInternalBucketOps))).Queries("bucket", "{bucket:.*}").Queries("operation", "{operation:.*}")
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/iam-item").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRInternalReplicateIAMItem)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/bucket-meta").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRInternalReplicateBucketItem)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/peer/idp-settings").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRInternalGetIDPSettings)))
 		}
 
 		if globalIsDistErasure {
@@ -207,7 +217,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest").HandlerFunc(httpTraceHdrs(adminAPI.SpeedtestHandler))
 
 		// HTTP Trace
-		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/trace").HandlerFunc(gz(adminAPI.TraceHandler))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/trace").HandlerFunc(gz(http.HandlerFunc(adminAPI.TraceHandler)))
 
 		// Console Logs
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/log").HandlerFunc(gz(httpTraceAll(adminAPI.ConsoleLogHandler)))

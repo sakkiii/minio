@@ -27,22 +27,37 @@ import (
 
 type iamDummyStore struct {
 	sync.RWMutex
+	*iamCache
+	usersSysType UsersSysType
 }
 
-func (ids *iamDummyStore) lock() {
+func newIAMDummyStore(usersSysType UsersSysType) *iamDummyStore {
+	return &iamDummyStore{
+		iamCache:     newIamCache(),
+		usersSysType: usersSysType,
+	}
+}
+
+func (ids *iamDummyStore) rlock() *iamCache {
+	ids.RLock()
+	return ids.iamCache
+}
+
+func (ids *iamDummyStore) runlock() {
+	ids.RUnlock()
+}
+
+func (ids *iamDummyStore) lock() *iamCache {
 	ids.Lock()
+	return ids.iamCache
 }
 
 func (ids *iamDummyStore) unlock() {
 	ids.Unlock()
 }
 
-func (ids *iamDummyStore) rlock() {
-	ids.RLock()
-}
-
-func (ids *iamDummyStore) runlock() {
-	ids.RUnlock()
+func (ids *iamDummyStore) getUsersSysType() UsersSysType {
+	return ids.usersSysType
 }
 
 func (ids *iamDummyStore) migrateBackendFormat(context.Context) error {
@@ -79,10 +94,6 @@ func (ids *iamDummyStore) loadMappedPolicy(ctx context.Context, name string, use
 
 func (ids *iamDummyStore) loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error {
 	return nil
-}
-
-func (ids *iamDummyStore) loadAll(ctx context.Context, sys *IAMSys) error {
-	return sys.Load(ctx, ids)
 }
 
 func (ids *iamDummyStore) saveIAMConfig(ctx context.Context, item interface{}, path string, opts ...options) error {
@@ -127,7 +138,4 @@ func (ids *iamDummyStore) deleteUserIdentity(ctx context.Context, name string, u
 
 func (ids *iamDummyStore) deleteGroupInfo(ctx context.Context, name string) error {
 	return nil
-}
-
-func (ids *iamDummyStore) watch(context.Context, *IAMSys) {
 }

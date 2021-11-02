@@ -173,7 +173,8 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 	var rc io.ReadCloser
 
 	if file.UncompressedSize64 > 0 {
-		rs := &HTTPRangeSpec{Start: file.Offset, End: file.Offset + int64(file.UncompressedSize64) - 1}
+		// We do not know where the file ends, but the returned reader only returns UncompressedSize.
+		rs := &HTTPRangeSpec{Start: file.Offset, End: -1}
 		gr, err := objectAPI.GetObjectNInfo(ctx, bucket, zipPath, rs, nil, readLock, opts)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -196,7 +197,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		return
 	}
 
-	setHeadGetRespHeaders(w, r.URL.Query())
+	setHeadGetRespHeaders(w, r.Form)
 
 	httpWriter := ioutil.WriteOnClose(w)
 
@@ -467,7 +468,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 	}
 
 	// Set any additional requested response headers.
-	setHeadGetRespHeaders(w, r.URL.Query())
+	setHeadGetRespHeaders(w, r.Form)
 
 	// Successful response.
 	if rs != nil {

@@ -23,6 +23,7 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -265,6 +266,24 @@ func (client *storageRESTClient) SetDiskID(id string) {
 	client.diskID = id
 }
 
+func (client *storageRESTClient) diskInfo() (interface{}, error) {
+	var info DiskInfo
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	respBody, err := client.call(ctx, storageRESTMethodDiskInfo, nil, nil, -1)
+	if err != nil {
+		return info, err
+	}
+	defer xhttp.DrainBody(respBody)
+	if err = msgp.Decode(respBody, &info); err != nil {
+		return info, err
+	}
+	if info.Error != "" {
+		return info, toStorageErr(errors.New(info.Error))
+	}
+	return info, nil
+}
+
 // DiskInfo - fetch disk information for a remote disk.
 func (client *storageRESTClient) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
 	if !client.IsOnline() {
@@ -277,28 +296,12 @@ func (client *storageRESTClient) DiskInfo(ctx context.Context) (info DiskInfo, e
 	}
 	client.diskInfoCache.Once.Do(func() {
 		client.diskInfoCache.TTL = time.Second
-		client.diskInfoCache.Update = func() (interface{}, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			respBody, err := client.call(ctx, storageRESTMethodDiskInfo, nil, nil, -1)
-			if err != nil {
-				return info, err
-			}
-			defer xhttp.DrainBody(respBody)
-			if err = msgp.Decode(respBody, &info); err != nil {
-				return info, err
-			}
-			if info.Error != "" {
-				return info, toStorageErr(errors.New(info.Error))
-			}
-			return info, nil
-		}
+		client.diskInfoCache.Update = client.diskInfo
 	})
 	val, err := client.diskInfoCache.Get()
-	if err == nil {
-		info = val.(DiskInfo)
+	if val != nil {
+		return val.(DiskInfo), err
 	}
-
 	return info, err
 }
 
@@ -375,6 +378,10 @@ func (client *storageRESTClient) CreateFile(ctx context.Context, volume, path st
 	values.Set(storageRESTLength, strconv.Itoa(int(size)))
 	respBody, err := client.call(ctx, storageRESTMethodCreateFile, values, ioutil.NopCloser(reader), size)
 	defer xhttp.DrainBody(respBody)
+	if err != nil {
+		return err
+	}
+	_, err = waitForHTTPResponse(respBody)
 	return err
 }
 
@@ -583,7 +590,7 @@ func (client *storageRESTClient) Delete(ctx context.Context, volume string, path
 }
 
 // DeleteVersions - deletes list of specified versions if present
-func (client *storageRESTClient) DeleteVersions(ctx context.Context, volume string, versions []FileInfo) (errs []error) {
+func (client *storageRESTClient) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) (errs []error) {
 	if len(versions) == 0 {
 		return errs
 	}
@@ -674,10 +681,11 @@ func (client *storageRESTClient) VerifyFile(ctx context.Context, volume, path st
 	return toStorageErr(verifyResp.Err)
 }
 
-func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path string) (stat StatInfo, err error) {
+func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
+	values.Set(storageRESTGlob, fmt.Sprint(glob))
 	respBody, err := client.call(ctx, storageRESTMethodStatInfoFile, values, nil, -1)
 	if err != nil {
 		return stat, err
@@ -687,7 +695,19 @@ func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path 
 	if err != nil {
 		return stat, err
 	}
-	err = stat.DecodeMsg(msgpNewReader(respReader))
+	rd := msgpNewReader(respReader)
+	for {
+		var st StatInfo
+		err = st.DecodeMsg(rd)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			break
+		}
+		stat = append(stat, st)
+	}
+
 	return stat, err
 }
 

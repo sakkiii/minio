@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
@@ -104,6 +105,12 @@ func TestParseAndValidateLifecycleConfig(t *testing.T) {
 			expectedParsingErr:    nil,
 			expectedValidationErr: nil,
 		},
+		// Lifecycle with zero Transition Days
+		{
+			inputConfig:           `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>rule</ID><Filter></Filter><Status>Enabled</Status><Transition><Days>0</Days><StorageClass>S3TIER-1</StorageClass></Transition></Rule></LifecycleConfiguration>`,
+			expectedParsingErr:    nil,
+			expectedValidationErr: nil,
+		},
 	}
 
 	for i, tc := range testCases {
@@ -119,7 +126,7 @@ func TestParseAndValidateLifecycleConfig(t *testing.T) {
 			}
 			err = lc.Validate()
 			if err != tc.expectedValidationErr {
-				t.Fatalf("%d: Expected %v during parsing but got %v", i+1, tc.expectedValidationErr, err)
+				t.Fatalf("%d: Expected %v during validation but got %v", i+1, tc.expectedValidationErr, err)
 			}
 		})
 	}
@@ -146,7 +153,7 @@ func TestMarshalLifecycleConfig(t *testing.T) {
 				Status:                      "Enabled",
 				Filter:                      Filter{Prefix: Prefix{string: "prefix-1", set: true}},
 				Expiration:                  Expiration{Date: midnightTS},
-				NoncurrentVersionTransition: NoncurrentVersionTransition{NoncurrentDays: 2, StorageClass: "TEST"},
+				NoncurrentVersionTransition: NoncurrentVersionTransition{NoncurrentDays: TransitionDays(2), StorageClass: "TEST"},
 			},
 		},
 	}
@@ -210,12 +217,15 @@ func TestExpectedExpiryTime(t *testing.T) {
 
 func TestComputeActions(t *testing.T) {
 	testCases := []struct {
-		inputConfig        string
-		objectName         string
-		objectTags         string
-		objectModTime      time.Time
-		isExpiredDelMarker bool
-		expectedAction     Action
+		inputConfig            string
+		objectName             string
+		objectTags             string
+		objectModTime          time.Time
+		isExpiredDelMarker     bool
+		expectedAction         Action
+		isNoncurrent           bool
+		objectSuccessorModTime time.Time
+		versionID              string
 	}{
 		// Empty object name (unexpected case) should always return NoneAction
 		{
@@ -380,6 +390,23 @@ func TestComputeActions(t *testing.T) {
 			isExpiredDelMarker: true,
 			expectedAction:     DeleteVersionAction,
 		},
+		// Should transition immediately when Transition days is zero
+		{
+			inputConfig:    `<BucketLifecycleConfiguration><Rule><Filter></Filter><Status>Enabled</Status><Transition><Days>0</Days><StorageClass>S3TIER-1</StorageClass></Transition></Rule></BucketLifecycleConfiguration>`,
+			objectName:     "foodir/fooobject",
+			objectModTime:  time.Now().UTC(), // Created now
+			expectedAction: TransitionAction,
+		},
+		// Should transition immediately when NoncurrentVersion Transition days is zero
+		{
+			inputConfig:            `<BucketLifecycleConfiguration><Rule><Filter></Filter><Status>Enabled</Status><NoncurrentVersionTransition><NoncurrentDays>0</NoncurrentDays><StorageClass>S3TIER-1</StorageClass></NoncurrentVersionTransition></Rule></BucketLifecycleConfiguration>`,
+			objectName:             "foodir/fooobject",
+			objectModTime:          time.Now().UTC(), // Created now
+			expectedAction:         TransitionVersionAction,
+			isNoncurrent:           true,
+			objectSuccessorModTime: time.Now().UTC(),
+			versionID:              uuid.New().String(),
+		},
 	}
 
 	for _, tc := range testCases {
@@ -390,12 +417,14 @@ func TestComputeActions(t *testing.T) {
 				t.Fatalf("Got unexpected error: %v", err)
 			}
 			if resultAction := lc.ComputeAction(ObjectOpts{
-				Name:         tc.objectName,
-				UserTags:     tc.objectTags,
-				ModTime:      tc.objectModTime,
-				DeleteMarker: tc.isExpiredDelMarker,
-				NumVersions:  1,
-				IsLatest:     true,
+				Name:             tc.objectName,
+				UserTags:         tc.objectTags,
+				ModTime:          tc.objectModTime,
+				DeleteMarker:     tc.isExpiredDelMarker,
+				NumVersions:      1,
+				IsLatest:         !tc.isNoncurrent,
+				SuccessorModTime: tc.objectSuccessorModTime,
+				VersionID:        tc.versionID,
 			}); resultAction != tc.expectedAction {
 				t.Fatalf("Expected action: `%v`, got: `%v`", tc.expectedAction, resultAction)
 			}
@@ -440,6 +469,16 @@ func TestHasActiveRules(t *testing.T) {
 			inputConfig:    `<LifecycleConfiguration><Rule><Filter><Prefix>foodir/</Prefix></Filter><Status>Enabled</Status><Expiration><Date>2999-01-01T00:00:00.000Z</Date></Expiration></Rule></LifecycleConfiguration>`,
 			prefix:         "foodir/foobject",
 			expectedNonRec: false, expectedRec: false,
+		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><StorageClass>S3TIER-1</StorageClass></Transition></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/foobject/foo.txt",
+			expectedNonRec: true, expectedRec: true,
+		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Status>Enabled</Status><NoncurrentVersionTransition><StorageClass>S3TIER-1</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/foobject/foo.txt",
+			expectedNonRec: true, expectedRec: true,
 		},
 	}
 
@@ -486,7 +525,7 @@ func TestSetPredictionHeaders(t *testing.T) {
 				ID:     "rule-3",
 				Status: "Enabled",
 				NoncurrentVersionTransition: NoncurrentVersionTransition{
-					NoncurrentDays: ExpirationDays(5),
+					NoncurrentDays: TransitionDays(5),
 					StorageClass:   "TIER-2",
 					set:            true,
 				},
@@ -559,7 +598,7 @@ func TestTransitionTier(t *testing.T) {
 				ID:     "rule-2",
 				Status: "Enabled",
 				NoncurrentVersionTransition: NoncurrentVersionTransition{
-					NoncurrentDays: ExpirationDays(3),
+					NoncurrentDays: TransitionDays(3),
 					StorageClass:   "TIER-2",
 				},
 			},

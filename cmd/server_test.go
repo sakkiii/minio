@@ -141,7 +141,7 @@ func TestServerSuite(t *testing.T) {
 }
 
 // Setting up the test suite.
-// Starting the Test server with temporary FS backend.
+// Starting the Test server with temporary backend.
 func (s *TestSuiteCommon) SetUpSuite(c *check) {
 	if s.secure {
 		cert, key, err := generateTLSCertKey("127.0.0.1")
@@ -158,7 +158,6 @@ func (s *TestSuiteCommon) SetUpSuite(c *check) {
 	s.secretKey = s.testServer.SecretKey
 }
 
-// Called implicitly by "gopkg.in/check.v1" after all tests are run.
 func (s *TestSuiteCommon) TearDownSuite(c *check) {
 	s.testServer.Stop()
 }
@@ -2428,7 +2427,7 @@ func (s *TestSuiteCommon) TestObjectMultipartListError(c *check) {
 	c.Assert(err, nil)
 	// Since max-keys parameter in the ListMultipart request set to invalid value of -2,
 	// its expected to fail with error message "InvalidArgument".
-	verifyError(c, response4, "InvalidArgument", "Argument max-parts must be an integer between 0 and 2147483647", http.StatusBadRequest)
+	verifyError(c, response4, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive", http.StatusBadRequest)
 }
 
 // TestObjectValidMD5 - First uploads an object with a valid Content-Md5 header and verifies the status,

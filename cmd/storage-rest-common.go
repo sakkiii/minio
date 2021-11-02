@@ -18,7 +18,7 @@
 package cmd
 
 const (
-	storageRESTVersion       = "v38" // Remove CheckFile API
+	storageRESTVersion       = "v41" // Optimized DeleteVersions API
 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
@@ -78,4 +78,5 @@ const (
 	storageRESTBitrotHash     = "bitrot-hash"
 	storageRESTDiskID         = "disk-id"
 	storageRESTForceDelete    = "force-delete"
+	storageRESTGlob           = "glob"
 )

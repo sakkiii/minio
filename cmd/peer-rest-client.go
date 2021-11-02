@@ -137,16 +137,19 @@ func (client *peerRESTClient) doNetTest(ctx context.Context, dataSize int64, thr
 
 	// ensure enough samples to obtain normal distribution
 	maxSamples := int(10 * threadCount)
+	if maxSamples > 50 {
+		maxSamples = 50
+	}
 
 	innerCtx, cancel := context.WithCancel(ctx)
 
 	slowSamples := int32(0)
-	maxSlowSamples := int32(maxSamples / 20)
+	maxSlowSamples := int32(maxSamples/20) + 1 // 5% of total
 	slowSample := func() {
-		if slowSamples > maxSlowSamples { // 5% of total
+		if slowSamples > maxSlowSamples {
 			return
 		}
-		if atomic.AddInt32(&slowSamples, 1) >= maxSlowSamples {
+		if atomic.AddInt32(&slowSamples, 1) > maxSlowSamples {
 			errChan <- networkOverloaded
 			cancel()
 		}
@@ -159,11 +162,19 @@ func (client *peerRESTClient) doNetTest(ctx context.Context, dataSize int64, thr
 	}
 
 	for i := 0; i < maxSamples; i++ {
+		if slowSamples > maxSlowSamples {
+			break
+		}
+
 		select {
 		case <-ctx.Done():
+			cancel()
 			return info, ctx.Err()
 		case err = <-errChan:
 		case buflimiter <- struct{}{}:
+			if slowSamples > maxSlowSamples {
+				break
+			}
 			wg.Add(1)
 
 			if innerCtx.Err() != nil {
@@ -175,7 +186,7 @@ func (client *peerRESTClient) doNetTest(ctx context.Context, dataSize int64, thr
 				start := time.Now()
 				before := atomic.LoadInt64(&totalTransferred)
 
-				ctx, cancel := context.WithTimeout(innerCtx, 10*time.Second)
+				ctx, cancel := context.WithTimeout(innerCtx, 3*time.Second)
 				defer cancel()
 
 				progress := io.LimitReader(&nullReader{}, dataSize)
@@ -223,6 +234,9 @@ func (client *peerRESTClient) doNetTest(ctx context.Context, dataSize int64, thr
 	}
 	wg.Wait()
 
+	if slowSamples > maxSlowSamples {
+		return info, networkOverloaded
+	}
 	if err != nil {
 		return info, err
 	}
@@ -331,10 +345,6 @@ func (client *peerRESTClient) GetNetPerfInfo(ctx context.Context) (info madmin.P
 			if err == networkOverloaded {
 				continue
 			}
-
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				continue
-			}
 		}
 		return info, err
 	}
@@ -400,7 +410,29 @@ func (client *peerRESTClient) GetOSInfo(ctx context.Context) (info madmin.OSInfo
 	return info, err
 }
 
-// GetSysErrors - fetch memory information for a remote node.
+// GetSELinuxInfo - fetch SELinux information for a remote node.
+func (client *peerRESTClient) GetSELinuxInfo(ctx context.Context) (info madmin.SysServices, err error) {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodSysServices, nil, nil, -1)
+	if err != nil {
+		return
+	}
+	defer http.DrainBody(respBody)
+	err = gob.NewDecoder(respBody).Decode(&info)
+	return info, err
+}
+
+// GetSysConfig - fetch sys config for a remote node.
+func (client *peerRESTClient) GetSysConfig(ctx context.Context) (info madmin.SysConfig, err error) {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodSysConfig, nil, nil, -1)
+	if err != nil {
+		return
+	}
+	defer http.DrainBody(respBody)
+	err = gob.NewDecoder(respBody).Decode(&info)
+	return info, err
+}
+
+// GetSysErrors - fetch sys errors for a remote node.
 func (client *peerRESTClient) GetSysErrors(ctx context.Context) (info madmin.SysErrors, err error) {
 	respBody, err := client.callWithContext(ctx, peerRESTMethodSysErrors, nil, nil, -1)
 	if err != nil {
@@ -992,9 +1024,27 @@ func (client *peerRESTClient) Speedtest(ctx context.Context, size, concurrent in
 		return SpeedtestResult{}, err
 	}
 	defer http.DrainBody(respBody)
+	waitReader, err := waitForHTTPResponse(respBody)
+	if err != nil {
+		return SpeedtestResult{}, err
+	}
 
-	dec := gob.NewDecoder(respBody)
 	var result SpeedtestResult
-	err = dec.Decode(&result)
-	return result, err
+	err = gob.NewDecoder(waitReader).Decode(&result)
+	if err != nil {
+		return result, err
+	}
+	if result.Error != "" {
+		return result, errors.New(result.Error)
+	}
+	return result, nil
+}
+
+func (client *peerRESTClient) ReloadSiteReplicationConfig(ctx context.Context) error {
+	respBody, err := client.callWithContext(context.Background(), peerRESTMethodReloadSiteReplicationConfig, nil, nil, -1)
+	if err != nil {
+		return err
+	}
+	defer http.DrainBody(respBody)
+	return nil
 }

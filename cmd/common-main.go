@@ -51,7 +51,6 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/handlers"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/certs"
@@ -59,6 +58,7 @@ import (
 	"github.com/minio/pkg/ellipses"
 	"github.com/minio/pkg/env"
 	xnet "github.com/minio/pkg/net"
+	"github.com/rs/dnscache"
 )
 
 // serverDebugLog will enable debug printing
@@ -71,16 +71,33 @@ func init() {
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
-		// 30 seconds matches the orchestrator DNS TTLs, have
-		// a 5 second timeout to lookup from DNS servers.
-		globalDNSCache = xhttp.NewDNSCache(30*time.Second, 5*time.Second, logger.LogOnceIf)
-	} else {
-		// On bare-metals DNS do not change often, so it is
-		// safe to assume a higher timeout upto 10 minutes.
-		globalDNSCache = xhttp.NewDNSCache(10*time.Minute, 5*time.Second, logger.LogOnceIf)
-	}
 	initGlobalContext()
+
+	options := dnscache.ResolverRefreshOptions{
+		ClearUnused:      true,
+		PersistOnFailure: false,
+	}
+
+	// Call to refresh will refresh names in cache. If you pass true, it will also
+	// remove cached names not looked up since the last call to Refresh. It is a good idea
+	// to call this method on a regular interval.
+	go func() {
+		var t *time.Ticker
+		if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
+			t = time.NewTicker(1 * time.Minute)
+		} else {
+			t = time.NewTicker(10 * time.Minute)
+		}
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				globalDNSCache.RefreshWithOptions(options)
+			case <-GlobalContext.Done():
+				return
+			}
+		}
+	}()
 
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
@@ -91,8 +108,6 @@ func init() {
 			}
 		},
 	})
-
-	globalTransitionState = newTransitionState()
 
 	console.SetColor("Debug", fcolor.New())
 
@@ -140,12 +155,15 @@ func minioConfigToConsoleFeatures() {
 	}
 	// if IDP is enabled, set IDP environment variables
 	if globalOpenIDConfig.URL != nil {
-		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.DiscoveryDoc.Issuer)
+		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.URL.String())
 		os.Setenv("CONSOLE_IDP_CLIENT_ID", globalOpenIDConfig.ClientID)
 		os.Setenv("CONSOLE_IDP_SECRET", globalOpenIDConfig.ClientSecret)
 		os.Setenv("CONSOLE_IDP_HMAC_SALT", globalDeploymentID)
 		os.Setenv("CONSOLE_IDP_HMAC_PASSPHRASE", globalOpenIDConfig.ClientID)
 		os.Setenv("CONSOLE_IDP_SCOPES", strings.Join(globalOpenIDConfig.DiscoveryDoc.ScopesSupported, ","))
+		if globalOpenIDConfig.ClaimUserinfo {
+			os.Setenv("CONSOLE_IDP_USERINFO", "on")
+		}
 		if globalOpenIDConfig.RedirectURI != "" {
 			os.Setenv("CONSOLE_IDP_CALLBACK", globalOpenIDConfig.RedirectURI)
 		} else {
@@ -154,6 +172,9 @@ func minioConfigToConsoleFeatures() {
 	}
 	os.Setenv("CONSOLE_MINIO_REGION", globalServerRegion)
 	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
+	if globalSubnetConfig.License != "" {
+		os.Setenv("CONSOLE_SUBNET_LICENSE", globalSubnetConfig.License)
+	}
 }
 
 func initConsoleServer() (*restapi.Server, error) {
@@ -178,16 +199,16 @@ func initConsoleServer() (*restapi.Server, error) {
 		return nil, err
 	}
 
-	noLog := func(string, ...interface{}) {
-		// nothing to log
-	}
-
-	// Initialize MinIO loggers
-	restapi.LogInfo = noLog
-	restapi.LogError = noLog
-
 	api := operations.NewConsoleAPI(swaggerSpec)
-	api.Logger = noLog
+
+	if !serverDebugLog {
+		// Disable console logging if server debug log is not enabled
+		noLog := func(string, ...interface{}) {}
+
+		restapi.LogInfo = noLog
+		restapi.LogError = noLog
+		api.Logger = noLog
+	}
 
 	server := restapi.NewServer(api)
 	// register all APIs
@@ -215,11 +236,6 @@ func initConsoleServer() (*restapi.Server, error) {
 }
 
 func verifyObjectLayerFeatures(name string, objAPI ObjectLayer) {
-	if (GlobalKMS != nil) && !objAPI.IsEncryptionSupported() {
-		logger.Fatal(errInvalidArgument,
-			"Encryption support is requested but '%s' does not support encryption", name)
-	}
-
 	if strings.HasPrefix(name, "gateway") {
 		if GlobalGatewaySSE.IsSet() && GlobalKMS == nil {
 			uiErr := config.ErrInvalidGWSSEEnvValue(nil).Msg("MINIO_GATEWAY_SSE set but KMS is not configured")
@@ -598,10 +614,6 @@ func handleCommonEnvVars() {
 			logger.Fatal(err, "Unable to initialize a connection to KES as specified by the shell environment")
 		}
 		GlobalKMS = KMS
-	}
-
-	if tiers := env.Get("_MINIO_DEBUG_REMOTE_TIERS_IMMEDIATELY", ""); tiers != "" {
-		globalDebugRemoteTiersImmediately = strings.Split(tiers, ",")
 	}
 }
 

@@ -131,18 +131,29 @@ func (o *listPathOptions) debugln(data ...interface{}) {
 
 // gatherResults will collect all results on the input channel and filter results according to the options.
 // Caller should close the channel when done.
-// The returned function will return the results once there is enough or input is closed.
-func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCacheEntriesSorted, error) {
+// The returned function will return the results once there is enough or input is closed,
+// or the context is canceled.
+func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCacheEntry) func() (metaCacheEntriesSorted, error) {
 	var resultsDone = make(chan metaCacheEntriesSorted)
 	// Copy so we can mutate
 	resCh := resultsDone
+	var done bool
+	var mu sync.Mutex
 	resErr := io.EOF
 
 	go func() {
 		var results metaCacheEntriesSorted
+		var returned bool
 		for entry := range in {
-			if resCh == nil {
+			if returned {
 				// past limit
+				continue
+			}
+			mu.Lock()
+			returned = done
+			mu.Unlock()
+			if returned {
+				resCh = nil
 				continue
 			}
 			if !o.IncludeDirectories && entry.isDir() {
@@ -167,6 +178,7 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 					resErr = nil
 					resCh <- results
 					resCh = nil
+					returned = true
 				}
 				continue
 			}
@@ -178,7 +190,15 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 		}
 	}()
 	return func() (metaCacheEntriesSorted, error) {
-		return <-resultsDone, resErr
+		select {
+		case <-ctx.Done():
+			mu.Lock()
+			done = true
+			mu.Unlock()
+			return metaCacheEntriesSorted{}, ctx.Err()
+		case r := <-resultsDone:
+			return r, resErr
+		}
 	}
 }
 
@@ -331,10 +351,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 	rpc := globalNotificationSys.restClientFromHash(o.Bucket)
 
 	for {
-		select {
-		case <-ctx.Done():
+		if contextCanceled(ctx) {
 			return entries, ctx.Err()
-		default:
 		}
 
 		// If many failures, check the cache state.
@@ -346,13 +364,15 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			retries = 1
 		}
 
-		const retryDelay = 500 * time.Millisecond
-		// Load first part metadata...
+		const retryDelay = 250 * time.Millisecond
 		// All operations are performed without locks, so we must be careful and allow for failures.
 		// Read metadata associated with the object from a disk.
 		if retries > 0 {
 			for _, disk := range er.getDisks() {
 				if disk == nil {
+					continue
+				}
+				if !disk.IsOnline() {
 					continue
 				}
 				_, err := disk.ReadVersion(ctx, minioMetaBucket,
@@ -366,6 +386,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			}
 		}
 
+		// Load first part metadata...
 		// Read metadata associated with the object from all disks.
 		fi, metaArr, onlineDisks, err := er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(0), ObjectOptions{}, true)
 		if err != nil {
@@ -404,10 +425,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 		// We got a stream to start at.
 		loadedPart := 0
 		for {
-			select {
-			case <-ctx.Done():
+			if contextCanceled(ctx) {
 				return entries, ctx.Err()
-			default:
 			}
 
 			if partN != loadedPart {
@@ -425,6 +444,9 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 						if disk == nil {
 							continue
 						}
+						if !disk.IsOnline() {
+							continue
+						}
 						_, err := disk.ReadVersion(ctx, minioMetaBucket,
 							o.objectPath(partN), "", false)
 						if err != nil {
@@ -436,7 +458,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 					}
 				}
 
-				// Load first part metadata...
+				// Load partN metadata...
 				fi, metaArr, onlineDisks, err = er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(partN), ObjectOptions{}, true)
 				if err != nil {
 					time.Sleep(retryDelay)
@@ -579,7 +601,7 @@ type metaCacheRPC struct {
 
 func (m *metaCacheRPC) setErr(err string) {
 	m.mu.Lock()
-	defer m.mu.Lock()
+	defer m.mu.Unlock()
 	meta := *m.meta
 	if meta.status != scanStateError {
 		meta.error = err
@@ -623,11 +645,20 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 			metaMu.Lock()
 			meta := *mc.meta
 			meta, err = o.updateMetacacheListing(meta, rpc)
-			*mc.meta = meta
-			if meta.status == scanStateError {
-				logger.LogIf(ctx, err)
+			if err == nil && time.Since(meta.lastHandout) > metacacheMaxClientWait {
 				cancel()
 				exit = true
+				meta.status = scanStateError
+				meta.error = fmt.Sprintf("listing canceled since time since last handout was %v ago", time.Since(meta.lastHandout).Round(time.Second))
+				o.debugln(color.Green("saveMetaCacheStream: ") + meta.error)
+				meta, err = o.updateMetacacheListing(meta, rpc)
+			}
+			if err == nil {
+				*mc.meta = meta
+				if meta.status == scanStateError {
+					cancel()
+					exit = true
+				}
 			}
 			metaMu.Unlock()
 		}
@@ -644,13 +675,12 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 		if len(b.data) == 0 && b.n == 0 && o.Transient {
 			return nil
 		}
-		o.debugln(color.Green("listPath:")+" saving block", b.n, "to", o.objectPath(b.n))
+		o.debugln(color.Green("saveMetaCacheStream:")+" saving block", b.n, "to", o.objectPath(b.n))
 		r, err := hash.NewReader(bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
 		logger.LogIf(ctx, err)
 		custom := b.headerKV()
-		_, err = er.putObject(ctx, minioMetaBucket, o.objectPath(b.n), NewPutObjReader(r), ObjectOptions{
+		_, err = er.putMetacacheObject(ctx, o.objectPath(b.n), NewPutObjReader(r), ObjectOptions{
 			UserDefined: custom,
-			NoLock:      true, // No need to hold namespace lock, each prefix caches uniquely.
 		})
 		if err != nil {
 			mc.setErr(err.Error())
@@ -677,6 +707,8 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 			switch err.(type) {
 			case ObjectNotFound:
 				return err
+			case StorageErr:
+				return err
 			case InsufficientReadQuorum:
 			default:
 				logger.LogIf(ctx, err)
@@ -690,26 +722,23 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 		return nil
 	})
 
-	metaMu.Lock()
+	// Blocks while consuming entries or an error occurs.
+	err = bw.Close()
 	if err != nil {
 		mc.setErr(err.Error())
-		return
+	}
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	if mc.meta.error != "" {
+		return err
 	}
 	// Save success
-	if mc.meta.error == "" {
-		mc.meta.status = scanStateSuccess
+	mc.meta.status = scanStateSuccess
+	meta, err := o.updateMetacacheListing(*mc.meta, rpc)
+	if err == nil {
+		*mc.meta = meta
 	}
-
-	meta := *mc.meta
-	meta, _ = o.updateMetacacheListing(meta, rpc)
-	*mc.meta = meta
-	metaMu.Unlock()
-
-	if err := bw.Close(); err != nil {
-		mc.setErr(err.Error())
-	}
-
-	return
+	return nil
 }
 
 type listPathRawOptions struct {
@@ -762,11 +791,13 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 	defer cancel()
 
 	fallback := func(err error) bool {
-		if err == nil {
-			return false
+		switch err.(type) {
+		case StorageErr:
+			// all supported disk errors
+			// attempt a fallback.
+			return true
 		}
-		return err.Error() == errUnformattedDisk.Error() ||
-			err.Error() == errVolumeNotFound.Error()
+		return false
 	}
 	askDisks := len(disks)
 	readers := make([]*metacacheReader, askDisks)
@@ -821,6 +852,8 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			if werr != io.EOF && werr != nil &&
 				werr.Error() != errFileNotFound.Error() &&
 				werr.Error() != errVolumeNotFound.Error() &&
+				werr.Error() != errDiskNotFound.Error() &&
+				werr.Error() != errUnformattedDisk.Error() &&
 				!errors.Is(werr, context.Canceled) {
 				logger.LogIf(ctx, werr)
 			}
@@ -851,12 +884,11 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				continue
 			case nil:
 			default:
-				if err.Error() == errFileNotFound.Error() {
-					atEOF++
-					fnf++
-					continue
-				}
-				if err.Error() == errVolumeNotFound.Error() {
+				switch err.Error() {
+				case errFileNotFound.Error(),
+					errVolumeNotFound.Error(),
+					errUnformattedDisk.Error(),
+					errDiskNotFound.Error():
 					atEOF++
 					fnf++
 					continue

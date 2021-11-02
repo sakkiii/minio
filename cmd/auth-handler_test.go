@@ -38,6 +38,7 @@ func TestGetRequestAuthType(t *testing.T) {
 		req   *http.Request
 		authT authType
 	}
+	nopCloser := ioutil.NopCloser(io.LimitReader(&nullReader{}, 1024))
 	testCases := []testCase{
 		// Test case - 1
 		// Check for generic signature v4 header.
@@ -54,6 +55,7 @@ func TestGetRequestAuthType(t *testing.T) {
 					"Content-Encoding":     []string{streamingContentEncoding},
 				},
 				Method: http.MethodPut,
+				Body:   nopCloser,
 			},
 			authT: authTypeStreamingSigned,
 		},
@@ -113,6 +115,7 @@ func TestGetRequestAuthType(t *testing.T) {
 					"Content-Type": []string{"multipart/form-data"},
 				},
 				Method: http.MethodPost,
+				Body:   nopCloser,
 			},
 			authT: authTypePostPolicy,
 		},
@@ -220,6 +223,7 @@ func TestIsRequestPresignedSignatureV2(t *testing.T) {
 		q := inputReq.URL.Query()
 		q.Add(testCase.inputQueryKey, testCase.inputQueryValue)
 		inputReq.URL.RawQuery = q.Encode()
+		inputReq.ParseForm()
 
 		actualResult := isRequestPresignedSignatureV2(inputReq)
 		if testCase.expectedResult != actualResult {
@@ -254,6 +258,7 @@ func TestIsRequestPresignedSignatureV4(t *testing.T) {
 		q := inputReq.URL.Query()
 		q.Add(testCase.inputQueryKey, testCase.inputQueryValue)
 		inputReq.URL.RawQuery = q.Encode()
+		inputReq.ParseForm()
 
 		actualResult := isRequestPresignedSignatureV4(inputReq)
 		if testCase.expectedResult != actualResult {
@@ -361,7 +366,7 @@ func TestIsReqAuthenticated(t *testing.T) {
 
 	initAllSubsystems(context.Background(), objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.InitStore(objLayer, globalEtcdClient)
 
 	creds, err := auth.CreateCredentials("myuser", "mypassword")
 	if err != nil {
@@ -452,7 +457,7 @@ func TestValidateAdminSignature(t *testing.T) {
 
 	initAllSubsystems(context.Background(), objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.InitStore(objLayer, globalEtcdClient)
 
 	creds, err := auth.CreateCredentials("admin", "mypassword")
 	if err != nil {

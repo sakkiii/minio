@@ -55,6 +55,11 @@ var ServerFlags = []cli.Flag{
 		Value: ":" + GlobalMinioDefaultPort,
 		Usage: "bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname",
 	},
+	cli.IntFlag{
+		Name:  "listeners",
+		Value: 1,
+		Usage: "bind N number of listeners per ADDRESS:PORT",
+	},
 	cli.StringFlag{
 		Name:  "console-address",
 		Usage: "bind to a specific ADDRESS:PORT for embedded Console UI, ADDRESS can be an IP or hostname",
@@ -105,10 +110,18 @@ EXAMPLES:
 }
 
 func serverCmdArgs(ctx *cli.Context) []string {
-	v := env.Get(config.EnvArgs, "")
+	v, _, _, err := env.LookupEnv(config.EnvArgs)
+	if err != nil {
+		logger.FatalIf(err, "Unable to validate passed arguments in %s:%s",
+			config.EnvArgs, os.Getenv(config.EnvArgs))
+	}
 	if v == "" {
-		// Fall back to older ENV MINIO_ENDPOINTS
-		v = env.Get(config.EnvEndpoints, "")
+		// Fall back to older environment value MINIO_ENDPOINTS
+		v, _, _, err = env.LookupEnv(config.EnvEndpoints)
+		if err != nil {
+			logger.FatalIf(err, "Unable to validate passed arguments in %s:%s",
+				config.EnvEndpoints, os.Getenv(config.EnvEndpoints))
+		}
 	}
 	if v == "" {
 		if !ctx.Args().Present() || ctx.Args().First() == "help" {
@@ -403,16 +416,15 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 	// Initialize bucket metadata sub-system.
 	globalBucketMetadataSys.Init(ctx, buckets, newObject)
 
-	// Initialize notification system.
+	// Initialize bucket notification sub-system.
 	globalNotificationSys.Init(ctx, buckets, newObject)
 
-	// Initialize bucket targets sub-system.
-	globalBucketTargetSys.Init(ctx, buckets, newObject)
+	// Initialize site replication manager.
+	globalSiteReplicationSys.Init(ctx, newObject)
 
 	if globalIsErasure {
 		// Initialize transition tier configuration manager
-		err = globalTierConfigMgr.Init(ctx, newObject)
-		if err != nil {
+		if err = globalTierConfigMgr.Init(ctx, newObject); err != nil {
 			return err
 		}
 	}
@@ -427,8 +439,6 @@ func (lw nullWriter) Write(b []byte) (int, error) {
 
 // serverMain handler called for 'minio server' command.
 func serverMain(ctx *cli.Context) {
-	defer globalDNSCache.Stop()
-
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
 	go handleSignals()
@@ -492,14 +502,23 @@ func serverMain(ctx *cli.Context) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
-	httpServer := xhttp.NewServer([]string{globalMinioAddr}, criticalErrorHandler{corsHandler(handler)}, getCert)
+	listeners := ctx.Int("listeners")
+	if listeners == 0 {
+		listeners = 1
+	}
+	addrs := make([]string, 0, listeners)
+	for i := 0; i < listeners; i++ {
+		addrs = append(addrs, globalMinioAddr)
+	}
+
+	httpServer := xhttp.NewServer(addrs, setCriticalErrorHandler(corsHandler(handler)), getCert)
 	httpServer.BaseContext = func(listener net.Listener) context.Context {
 		return GlobalContext
 	}
 	// Turn-off random logging by Go internally
 	httpServer.ErrorLog = log.New(&nullWriter{}, "", 0)
 	go func() {
-		globalHTTPServerErrorCh <- httpServer.Start()
+		globalHTTPServerErrorCh <- httpServer.Start(GlobalContext)
 	}()
 
 	setHTTPServer(httpServer)
@@ -530,7 +549,6 @@ func serverMain(ctx *cli.Context) {
 	if globalIsErasure {
 		initAutoHeal(GlobalContext, newObject)
 		initHealMRF(GlobalContext, newObject)
-		initBackgroundTransition(GlobalContext, newObject)
 	}
 
 	initBackgroundExpiry(GlobalContext, newObject)
@@ -552,12 +570,13 @@ func serverMain(ctx *cli.Context) {
 	}
 
 	// Initialize users credentials and policies in background right after config has initialized.
-	go globalIAMSys.Init(GlobalContext, newObject)
+	go globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalRefreshIAMInterval)
 
 	initDataScanner(GlobalContext, newObject)
 
 	if globalIsErasure { // to be done after config init
 		initBackgroundReplication(GlobalContext, newObject)
+		initBackgroundTransition(GlobalContext, newObject)
 		globalTierJournal, err = initTierDeletionJournal(GlobalContext)
 		if err != nil {
 			logger.FatalIf(err, "Unable to initialize remote tier pending deletes journal")
@@ -581,21 +600,30 @@ func serverMain(ctx *cli.Context) {
 		logStartupMessage(color.RedBold(msg))
 	}
 
+	if !globalCLIContext.StrictS3Compat {
+		logStartupMessage(color.RedBold("WARNING: Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
+	}
+
 	if globalBrowserEnabled {
-		consoleSrv, err := initConsoleServer()
+		globalConsoleSrv, err = initConsoleServer()
 		if err != nil {
 			logger.FatalIf(err, "Unable to initialize console service")
 		}
 
 		go func() {
-			logger.FatalIf(consoleSrv.Serve(), "Unable to initialize console server")
+			logger.FatalIf(globalConsoleSrv.Serve(), "Unable to initialize console server")
 		}()
-
-		<-globalOSSignalCh
-		consoleSrv.Shutdown()
-	} else {
-		<-globalOSSignalCh
 	}
+
+	if serverDebugLog {
+		logger.Info("== DEBUG Mode enabled ==")
+		logger.Info("Currently set environment settings:")
+		for _, v := range os.Environ() {
+			logger.Info(v)
+		}
+		logger.Info("======")
+	}
+	<-globalOSSignalCh
 }
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.

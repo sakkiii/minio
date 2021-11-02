@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/logger"
@@ -54,7 +53,7 @@ func (er erasureObjects) HealBucket(ctx context.Context, bucket string, opts mad
 }
 
 // Heal bucket - create buckets on disks where it does not exist.
-func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints []string, bucket string, writeQuorum int,
+func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints []Endpoint, bucket string, writeQuorum int,
 	opts madmin.HealOpts) (res madmin.HealResultItem, err error) {
 
 	// Initialize sync waitgroup.
@@ -115,7 +114,7 @@ func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints
 	for i := range beforeState {
 		res.Before.Drives = append(res.Before.Drives, madmin.HealDriveInfo{
 			UUID:     "",
-			Endpoint: storageEndpoints[i],
+			Endpoint: storageEndpoints[i].String(),
 			State:    beforeState[i],
 		})
 	}
@@ -125,7 +124,7 @@ func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints
 		for i := range beforeState {
 			res.After.Drives = append(res.After.Drives, madmin.HealDriveInfo{
 				UUID:     "",
-				Endpoint: storageEndpoints[i],
+				Endpoint: storageEndpoints[i].String(),
 				State:    madmin.DriveStateOk,
 			})
 		}
@@ -160,7 +159,7 @@ func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints
 	for i := range afterState {
 		res.After.Drives = append(res.After.Drives, madmin.HealDriveInfo{
 			UUID:     "",
-			Endpoint: storageEndpoints[i],
+			Endpoint: storageEndpoints[i].String(),
 			State:    afterState[i],
 		})
 	}
@@ -204,7 +203,7 @@ func listAllBuckets(ctx context.Context, storageDisks []StorageAPI, healBuckets 
 
 // Only heal on disks where we are sure that healing is needed. We can expand
 // this list as and when we figure out more errors can be added to this list safely.
-func shouldHealObjectOnDisk(erErr, dataErr error, meta FileInfo, quorumModTime time.Time) bool {
+func shouldHealObjectOnDisk(erErr, dataErr error, meta FileInfo, latestMeta FileInfo) bool {
 	switch {
 	case errors.Is(erErr, errFileNotFound) || errors.Is(erErr, errFileVersionNotFound):
 		return true
@@ -222,7 +221,16 @@ func shouldHealObjectOnDisk(erErr, dataErr error, meta FileInfo, quorumModTime t
 				return true
 			}
 		}
-		if !quorumModTime.Equal(meta.ModTime) {
+		if !latestMeta.MetadataEquals(meta) {
+			return true
+		}
+		if !latestMeta.TransitionInfoEquals(meta) {
+			return true
+		}
+		if !latestMeta.ReplicationInfoEquals(meta) {
+			return true
+		}
+		if !latestMeta.ModTime.Equal(meta.ModTime) {
 			return true
 		}
 		if meta.XLV1 {
@@ -267,7 +275,7 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 	// Re-read when we have lock...
 	partsMetadata, errs := readAllFileInfo(ctx, storageDisks, bucket, object, versionID, true)
 
-	if _, err = getLatestFileInfo(ctx, partsMetadata, errs); err != nil {
+	if _, err = getLatestFileInfo(ctx, partsMetadata, errs, er.defaultParityCount); err != nil {
 		return er.purgeObjectDangling(ctx, bucket, object, versionID, partsMetadata, errs, []error{}, opts)
 	}
 
@@ -294,6 +302,13 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 	// skipped from purging when they are stale.
 	availableDisks, dataErrs := disksWithAllParts(ctx, storageDisks, partsMetadata,
 		errs, bucket, object, scanMode)
+
+	// Latest FileInfo for reference. If a valid metadata is not
+	// present, it is as good as object not found.
+	latestMeta, err := pickValidFileInfo(ctx, partsMetadata, modTime, dataDir, result.DataBlocks)
+	if err != nil {
+		return result, toObjectErr(err, bucket, object, versionID)
+	}
 
 	// Loop to find number of disks with valid data, per-drive
 	// data state and a list of outdated disks on which data needs
@@ -325,29 +340,29 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 			driveState = madmin.DriveStateCorrupt
 		}
 
-		if shouldHealObjectOnDisk(errs[i], dataErrs[i], partsMetadata[i], modTime) {
+		if shouldHealObjectOnDisk(errs[i], dataErrs[i], partsMetadata[i], latestMeta) {
 			outDatedDisks[i] = storageDisks[i]
 			disksToHealCount++
 			result.Before.Drives = append(result.Before.Drives, madmin.HealDriveInfo{
 				UUID:     "",
-				Endpoint: storageEndpoints[i],
+				Endpoint: storageEndpoints[i].String(),
 				State:    driveState,
 			})
 			result.After.Drives = append(result.After.Drives, madmin.HealDriveInfo{
 				UUID:     "",
-				Endpoint: storageEndpoints[i],
+				Endpoint: storageEndpoints[i].String(),
 				State:    driveState,
 			})
 			continue
 		}
 		result.Before.Drives = append(result.Before.Drives, madmin.HealDriveInfo{
 			UUID:     "",
-			Endpoint: storageEndpoints[i],
+			Endpoint: storageEndpoints[i].String(),
 			State:    driveState,
 		})
 		result.After.Drives = append(result.After.Drives, madmin.HealDriveInfo{
 			UUID:     "",
-			Endpoint: storageEndpoints[i],
+			Endpoint: storageEndpoints[i].String(),
 			State:    driveState,
 		})
 	}
@@ -379,20 +394,12 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 		return result, nil
 	}
 
-	// Latest FileInfo for reference. If a valid metadata is not
-	// present, it is as good as object not found.
-	latestMeta, err := pickValidFileInfo(ctx, partsMetadata, modTime, dataDir, result.DataBlocks)
-	if err != nil {
-		return result, toObjectErr(err, bucket, object, versionID)
-	}
-
 	cleanFileInfo := func(fi FileInfo) FileInfo {
 		// Returns a copy of the 'fi' with checksums and parts nil'ed.
 		nfi := fi
-		nfi.Erasure.Index = 0
-		nfi.Erasure.Checksums = nil
-		if fi.IsRemote() {
-			nfi.Parts = nil
+		if !fi.IsRemote() {
+			nfi.Erasure.Index = 0
+			nfi.Erasure.Checksums = nil
 		}
 		return nfi
 	}
@@ -421,19 +428,19 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 	}
 
 	var inlineBuffers []*bytes.Buffer
-	if len(latestMeta.Parts) <= 1 && latestMeta.Size < smallFileThreshold {
+	if latestMeta.InlineData() {
 		inlineBuffers = make([]*bytes.Buffer, len(outDatedDisks))
 	}
+
+	// Reorder so that we have data disks first and parity disks next.
+	latestDisks := shuffleDisks(availableDisks, latestMeta.Erasure.Distribution)
+	outDatedDisks = shuffleDisks(outDatedDisks, latestMeta.Erasure.Distribution)
+	partsMetadata = shufflePartsMetadata(partsMetadata, latestMeta.Erasure.Distribution)
+	copyPartsMetadata = shufflePartsMetadata(copyPartsMetadata, latestMeta.Erasure.Distribution)
 
 	if !latestMeta.Deleted && !latestMeta.IsRemote() {
 		result.DataBlocks = latestMeta.Erasure.DataBlocks
 		result.ParityBlocks = latestMeta.Erasure.ParityBlocks
-
-		// Reorder so that we have data disks first and parity disks next.
-		latestDisks := shuffleDisks(availableDisks, latestMeta.Erasure.Distribution)
-		outDatedDisks = shuffleDisks(outDatedDisks, latestMeta.Erasure.Distribution)
-		partsMetadata = shufflePartsMetadata(partsMetadata, latestMeta.Erasure.Distribution)
-		copyPartsMetadata = shufflePartsMetadata(copyPartsMetadata, latestMeta.Erasure.Distribution)
 
 		// Heal each part. erasureHealFile() will write the healed
 		// part to .minio/tmp/uuid/ which needs to be renamed later to
@@ -472,7 +479,7 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 				}
 				partPath := pathJoin(tmpID, dstDataDir, fmt.Sprintf("part.%d", partNumber))
 				if len(inlineBuffers) > 0 {
-					inlineBuffers[i] = bytes.NewBuffer(make([]byte, 0, erasure.ShardFileSize(latestMeta.Size)))
+					inlineBuffers[i] = bytes.NewBuffer(make([]byte, 0, erasure.ShardFileSize(latestMeta.Size)+32))
 					writers[i] = newStreamingBitrotWriterBuffer(inlineBuffers[i], DefaultBitrotAlgorithm, erasure.ShardSize())
 				} else {
 					writers[i] = newBitrotWriter(disk, minioMetaTmpBucket, partPath,
@@ -531,20 +538,19 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 		if disk == OfflineDisk {
 			continue
 		}
-
 		// record the index of the updated disks
 		partsMetadata[i].Erasure.Index = i + 1
-
-		// dataDir should be empty when
-		// - transitionStatus is complete and not in restored state
-		if partsMetadata[i].IsRemote() {
-			partsMetadata[i].DataDir = ""
-		}
 
 		// Attempt a rename now from healed data to final location.
 		if err = disk.RenameData(ctx, minioMetaTmpBucket, tmpID, partsMetadata[i], bucket, object); err != nil {
 			logger.LogIf(ctx, err)
 			return result, toObjectErr(err, bucket, object)
+		}
+
+		// Remove any remaining parts from outdated disks from before transition.
+		if partsMetadata[i].IsRemote() {
+			rmDataDir := partsMetadata[i].DataDir
+			disk.DeleteVol(ctx, pathJoin(bucket, encodeDirObject(object), rmDataDir), true)
 		}
 
 		for i, v := range result.Before.Drives {
@@ -603,7 +609,7 @@ func (er erasureObjects) healObjectDir(ctx context.Context, bucket, object strin
 
 	// Prepare object creation in all disks
 	for i, err := range errs {
-		drive := storageEndpoints[i]
+		drive := storageEndpoints[i].String()
 		switch err {
 		case nil:
 			hr.Before.Drives[i] = madmin.HealDriveInfo{Endpoint: drive, State: madmin.DriveStateOk}
@@ -644,7 +650,7 @@ func (er erasureObjects) healObjectDir(ctx context.Context, bucket, object strin
 
 // Populates default heal result item entries with possible values when we are returning prematurely.
 // This is to ensure that in any circumstance we are not returning empty arrays with wrong values.
-func (er erasureObjects) defaultHealResult(lfi FileInfo, storageDisks []StorageAPI, storageEndpoints []string, errs []error, bucket, object, versionID string) madmin.HealResultItem {
+func (er erasureObjects) defaultHealResult(lfi FileInfo, storageDisks []StorageAPI, storageEndpoints []Endpoint, errs []error, bucket, object, versionID string) madmin.HealResultItem {
 	// Initialize heal result object
 	result := madmin.HealResultItem{
 		Type:       madmin.HealItemObject,
@@ -667,12 +673,12 @@ func (er erasureObjects) defaultHealResult(lfi FileInfo, storageDisks []StorageA
 		if disk == nil {
 			result.Before.Drives = append(result.Before.Drives, madmin.HealDriveInfo{
 				UUID:     "",
-				Endpoint: storageEndpoints[index],
+				Endpoint: storageEndpoints[index].String(),
 				State:    madmin.DriveStateOffline,
 			})
 			result.After.Drives = append(result.After.Drives, madmin.HealDriveInfo{
 				UUID:     "",
-				Endpoint: storageEndpoints[index],
+				Endpoint: storageEndpoints[index].String(),
 				State:    madmin.DriveStateOffline,
 			})
 			continue
@@ -686,12 +692,12 @@ func (er erasureObjects) defaultHealResult(lfi FileInfo, storageDisks []StorageA
 		}
 		result.Before.Drives = append(result.Before.Drives, madmin.HealDriveInfo{
 			UUID:     "",
-			Endpoint: storageEndpoints[index],
+			Endpoint: storageEndpoints[index].String(),
 			State:    driveState,
 		})
 		result.After.Drives = append(result.After.Drives, madmin.HealDriveInfo{
 			UUID:     "",
-			Endpoint: storageEndpoints[index],
+			Endpoint: storageEndpoints[index].String(),
 			State:    driveState,
 		})
 	}
@@ -879,6 +885,12 @@ func isObjectDangling(metaArr []FileInfo, errs []error, dataErrs []error) (valid
 
 // HealObject - heal the given object, automatically deletes the object if stale/corrupted if `remove` is true.
 func (er erasureObjects) HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (hr madmin.HealResultItem, err error) {
+	defer func() {
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			err = nil
+		}
+	}()
+
 	// Create context that also contains information about the object and bucket.
 	// The top level handler might not have this information.
 	reqInfo := logger.GetReqInfo(ctx)

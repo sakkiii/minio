@@ -20,13 +20,16 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/identity/openid"
 	xhttp "github.com/minio/minio/internal/http"
@@ -37,21 +40,23 @@ import (
 
 const (
 	// STS API version.
-	stsAPIVersion       = "2011-06-15"
-	stsVersion          = "Version"
-	stsAction           = "Action"
-	stsPolicy           = "Policy"
-	stsToken            = "Token"
-	stsWebIdentityToken = "WebIdentityToken"
-	stsDurationSeconds  = "DurationSeconds"
-	stsLDAPUsername     = "LDAPUsername"
-	stsLDAPPassword     = "LDAPPassword"
+	stsAPIVersion             = "2011-06-15"
+	stsVersion                = "Version"
+	stsAction                 = "Action"
+	stsPolicy                 = "Policy"
+	stsToken                  = "Token"
+	stsWebIdentityToken       = "WebIdentityToken"
+	stsWebIdentityAccessToken = "WebIdentityAccessToken" // only valid if UserInfo is enabled.
+	stsDurationSeconds        = "DurationSeconds"
+	stsLDAPUsername           = "LDAPUsername"
+	stsLDAPPassword           = "LDAPPassword"
 
 	// STS API action constants
-	clientGrants = "AssumeRoleWithClientGrants"
-	webIdentity  = "AssumeRoleWithWebIdentity"
-	ldapIdentity = "AssumeRoleWithLDAPIdentity"
-	assumeRole   = "AssumeRole"
+	clientGrants      = "AssumeRoleWithClientGrants"
+	webIdentity       = "AssumeRoleWithWebIdentity"
+	ldapIdentity      = "AssumeRoleWithLDAPIdentity"
+	clientCertificate = "AssumeRoleWithCertificate"
+	assumeRole        = "AssumeRole"
 
 	stsRequestBodyLimit = 10 * (1 << 20) // 10 MiB
 
@@ -95,14 +100,14 @@ func registerSTSRouter(router *mux.Router) {
 	stsRouter.Methods(http.MethodPost).MatcherFunc(func(r *http.Request, rm *mux.RouteMatch) bool {
 		ctypeOk := wildcard.MatchSimple("application/x-www-form-urlencoded*", r.Header.Get(xhttp.ContentType))
 		authOk := wildcard.MatchSimple(signV4Algorithm+"*", r.Header.Get(xhttp.Authorization))
-		noQueries := len(r.URL.Query()) == 0
+		noQueries := len(r.URL.RawQuery) == 0
 		return ctypeOk && authOk && noQueries
 	}).HandlerFunc(httpTraceAll(sts.AssumeRole))
 
 	// Assume roles with JWT handler, handles both ClientGrants and WebIdentity.
 	stsRouter.Methods(http.MethodPost).MatcherFunc(func(r *http.Request, rm *mux.RouteMatch) bool {
 		ctypeOk := wildcard.MatchSimple("application/x-www-form-urlencoded*", r.Header.Get(xhttp.ContentType))
-		noQueries := len(r.URL.Query()) == 0
+		noQueries := len(r.URL.RawQuery) == 0
 		return ctypeOk && noQueries
 	}).HandlerFunc(httpTraceAll(sts.AssumeRoleWithSSO))
 
@@ -124,6 +129,12 @@ func registerSTSRouter(router *mux.Router) {
 		Queries(stsVersion, stsAPIVersion).
 		Queries(stsLDAPUsername, "{LDAPUsername:.*}").
 		Queries(stsLDAPPassword, "{LDAPPassword:.*}")
+
+	// AssumeRoleWithCertificate
+	stsRouter.Methods(http.MethodPost).HandlerFunc(httpTraceAll(sts.AssumeRoleWithCertificate)).
+		Queries(stsAction, clientCertificate).
+		Queries(stsVersion, stsAPIVersion)
+
 }
 
 func checkAssumeRoleAuth(ctx context.Context, r *http.Request) (user auth.Credentials, isErrCodeSTS bool, stsErr STSErrorCode) {
@@ -155,6 +166,18 @@ func checkAssumeRoleAuth(ctx context.Context, r *http.Request) (user auth.Creden
 	return user, true, ErrSTSNone
 }
 
+func parseForm(r *http.Request) error {
+	if err := r.ParseForm(); err != nil {
+		return err
+	}
+	for k, v := range r.PostForm {
+		if _, ok := r.Form[k]; !ok {
+			r.Form[k] = v
+		}
+	}
+	return nil
+}
+
 // AssumeRole - implementation of AWS STS API AssumeRole to get temporary
 // credentials for regular users on Minio.
 // https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html
@@ -167,7 +190,7 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
+	if err := parseForm(r); err != nil {
 		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
 		return
 	}
@@ -254,10 +277,12 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Notify all other MinIO peers to reload temp users
-	for _, nerr := range globalNotificationSys.LoadUser(cred.AccessKey, true) {
-		if nerr.Err != nil {
-			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-			logger.LogIf(ctx, nerr.Err)
+	if !globalIAMSys.HasWatcher() {
+		for _, nerr := range globalNotificationSys.LoadUser(cred.AccessKey, true) {
+			if nerr.Err != nil {
+				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+				logger.LogIf(ctx, nerr.Err)
+			}
 		}
 	}
 
@@ -275,7 +300,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	ctx := newContext(r, w, "AssumeRoleSSOCommon")
 
 	// Parse the incoming form data.
-	if err := r.ParseForm(); err != nil {
+	if err := parseForm(r); err != nil {
 		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
 		return
 	}
@@ -315,7 +340,9 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 		token = r.Form.Get(stsWebIdentityToken)
 	}
 
-	m, err := v.Validate(token, r.Form.Get(stsDurationSeconds))
+	accessToken := r.Form.Get(stsWebIdentityAccessToken)
+
+	m, err := v.Validate(token, accessToken, r.Form.Get(stsDurationSeconds))
 	if err != nil {
 		switch err {
 		case openid.ErrTokenExpired:
@@ -456,10 +483,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Notify all other MinIO peers to reload temp users
-	for _, nerr := range globalNotificationSys.LoadUser(cred.AccessKey, true) {
-		if nerr.Err != nil {
-			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-			logger.LogIf(ctx, nerr.Err)
+	if !globalIAMSys.HasWatcher() {
+		for _, nerr := range globalNotificationSys.LoadUser(cred.AccessKey, true) {
+			if nerr.Err != nil {
+				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+				logger.LogIf(ctx, nerr.Err)
+			}
 		}
 	}
 
@@ -514,7 +543,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	defer logger.AuditLog(ctx, w, r, nil, stsLDAPPassword)
 
 	// Parse the incoming form data.
-	if err := r.ParseForm(); err != nil {
+	if err := parseForm(r); err != nil {
 		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
 		return
 	}
@@ -620,11 +649,26 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	}
 
 	// Notify all other MinIO peers to reload temp users
-	for _, nerr := range globalNotificationSys.LoadUser(cred.AccessKey, true) {
-		if nerr.Err != nil {
-			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-			logger.LogIf(ctx, nerr.Err)
+	if !globalIAMSys.HasWatcher() {
+		for _, nerr := range globalNotificationSys.LoadUser(cred.AccessKey, true) {
+			if nerr.Err != nil {
+				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+				logger.LogIf(ctx, nerr.Err)
+			}
 		}
+	}
+
+	// Call hook for cluster-replication.
+	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+		Type: madmin.SRIAMItemSTSAcc,
+		STSCredential: &madmin.SRSTSCredential{
+			AccessKey:    cred.AccessKey,
+			SecretKey:    cred.SecretKey,
+			SessionToken: cred.SessionToken,
+		},
+	}); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
 	}
 
 	ldapIdentityResponse := &AssumeRoleWithLDAPResponse{
@@ -636,4 +680,120 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	encodedSuccessResponse := encodeResponse(ldapIdentityResponse)
 
 	writeSuccessResponseXML(w, encodedSuccessResponse)
+}
+
+// AssumeRoleWithCertificate implements user authentication with client certificates.
+// It verifies the client-provided X.509 certificate, maps the certificate to an S3 policy
+// and returns temp. S3 credentials to the client.
+//
+// API endpoint: https://minio:9000?Action=AssumeRoleWithCertificate&Version=2011-06-15
+func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *http.Request) {
+	var ctx = newContext(r, w, "AssumeRoleWithCertificate")
+
+	if !globalSTSTLSConfig.Enabled {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSNotInitialized, errors.New("STS API 'AssumeRoleWithCertificate' is disabled"))
+		return
+	}
+
+	// We have to establish a TLS connection and the
+	// client must provide exactly one client certificate.
+	// Otherwise, we don't have a certificate to verify or
+	// the policy lookup would ambigious.
+	if r.TLS == nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInsecureConnection, errors.New("No TLS connection attempt"))
+		return
+	}
+
+	// A client may send a certificate chain such that we end up
+	// with multiple peer certificates. However, we can only accept
+	// a single client certificate. Otherwise, the certificate to
+	// policy mapping would be ambigious.
+	// However, we can filter all CA certificates and only check
+	// whether they client has sent exactly one (non-CA) leaf certificate.
+	var peerCertificates = make([]*x509.Certificate, 0, len(r.TLS.PeerCertificates))
+	for _, cert := range r.TLS.PeerCertificates {
+		if cert.IsCA {
+			continue
+		}
+		peerCertificates = append(peerCertificates, cert)
+	}
+	r.TLS.PeerCertificates = peerCertificates
+
+	// Now, we have to check that the client has provided exactly one leaf
+	// certificate that we can map to a policy.
+	if len(r.TLS.PeerCertificates) == 0 {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, errors.New("No client certificate provided"))
+		return
+	}
+	if len(r.TLS.PeerCertificates) > 1 {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, errors.New("More than one client certificate provided"))
+		return
+	}
+
+	var certificate = r.TLS.PeerCertificates[0]
+	if !globalSTSTLSConfig.InsecureSkipVerify { // Verify whether the client certificate has been issued by a trusted CA.
+		_, err := certificate.Verify(x509.VerifyOptions{
+			KeyUsages: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+			},
+			Roots: globalRootCAs,
+		})
+		if err != nil {
+			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidClientCertificate, err)
+			return
+		}
+	}
+
+	// We map the X.509 subject common name to the policy. So, a client
+	// with the common name "foo" will be associated with the policy "foo".
+	// Other mapping functions - e.g. public-key hash based mapping - are
+	// possible but not implemented.
+	//
+	// Group mapping is not possible with standard X.509 certificates.
+	if certificate.Subject.CommonName == "" {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, errors.New("certificate subject CN cannot be empty"))
+		return
+	}
+
+	expiry, err := globalSTSTLSConfig.GetExpiryDuration(r.Form.Get(stsDurationSeconds))
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSMissingParameter, err)
+		return
+	}
+
+	// We set the expiry of the temp. credentials to the minimum of the
+	// configured expiry and the duration until the certificate itself
+	// expires.
+	// We must not issue credentials that out-live the certificate.
+	if validUntil := time.Until(certificate.NotAfter); validUntil < expiry {
+		expiry = validUntil
+	}
+
+	// Associate any service accounts to the certificate CN
+	parentUser := "tls:" + certificate.Subject.CommonName
+
+	tmpCredentials, err := auth.GetNewCredentialsWithMetadata(map[string]interface{}{
+		expClaim:                   time.Now().UTC().Add(expiry).Unix(),
+		parentClaim:                parentUser,
+		subClaim:                   certificate.Subject.CommonName,
+		audClaim:                   certificate.Subject.Organization,
+		issClaim:                   certificate.Issuer.CommonName,
+		iamPolicyClaimNameOpenID(): certificate.Subject.CommonName,
+	}, globalActiveCred.SecretKey)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		return
+	}
+
+	tmpCredentials.ParentUser = parentUser
+	err = globalIAMSys.SetTempUser(tmpCredentials.AccessKey, tmpCredentials, certificate.Subject.CommonName)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		return
+	}
+
+	var response = new(AssumeRoleWithCertificateResponse)
+	response.Result.Credentials = tmpCredentials
+	response.Metadata.RequestID = w.Header().Get(xhttp.AmzRequestID)
+	writeSuccessResponseXML(w, encodeResponse(response))
 }

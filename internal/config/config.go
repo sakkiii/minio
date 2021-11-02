@@ -58,6 +58,7 @@ const (
 	RegionName = "name"
 	AccessKey  = "access_key"
 	SecretKey  = "secret_key"
+	License    = "license"
 )
 
 // Top level config constants.
@@ -66,6 +67,7 @@ const (
 	PolicyOPASubSys      = "policy_opa"
 	IdentityOpenIDSubSys = "identity_openid"
 	IdentityLDAPSubSys   = "identity_ldap"
+	IdentityTLSSubSys    = "identity_tls"
 	CacheSubSys          = "cache"
 	RegionSubSys         = "region"
 	EtcdSubSys           = "etcd"
@@ -78,6 +80,7 @@ const (
 	HealSubSys           = "heal"
 	ScannerSubSys        = "scanner"
 	CrawlerSubSys        = "crawler"
+	SubnetSubSys         = "subnet"
 
 	// Add new constants here if you add new fields to config.
 )
@@ -113,6 +116,7 @@ var SubSystems = set.CreateStringSet(
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	IdentityTLSSubSys,
 	ScannerSubSys,
 	HealSubSys,
 	NotifyAMQPSubSys,
@@ -125,6 +129,7 @@ var SubSystems = set.CreateStringSet(
 	NotifyPostgresSubSys,
 	NotifyRedisSubSys,
 	NotifyWebhookSubSys,
+	SubnetSubSys,
 )
 
 // SubSystemsDynamic - all sub-systems that have dynamic config.
@@ -133,6 +138,7 @@ var SubSystemsDynamic = set.CreateStringSet(
 	CompressionSubSys,
 	ScannerSubSys,
 	HealSubSys,
+	SubnetSubSys,
 )
 
 // SubSystemsSingleTargets - subsystems which only support single target.
@@ -147,6 +153,7 @@ var SubSystemsSingleTargets = set.CreateStringSet([]string{
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	IdentityTLSSubSys,
 	HealSubSys,
 	ScannerSubSys,
 }...)

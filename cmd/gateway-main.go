@@ -154,8 +154,6 @@ func ValidateGatewayArguments(serverAddr, endpointAddr string) error {
 
 // StartGateway - handler for 'minio gateway <name>'.
 func StartGateway(ctx *cli.Context, gw Gateway) {
-	defer globalDNSCache.Stop()
-
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
 	go handleSignals()
@@ -218,8 +216,6 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	// Set when gateway is enabled
 	globalIsGateway = true
 
-	enableConfigOps := false
-
 	// TODO: We need to move this code with globalConfigSys.Init()
 	// for now keep it here such that "s3" gateway layer initializes
 	// itself properly when KMS is set.
@@ -245,7 +241,7 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 
 	// Enable IAM admin APIs if etcd is enabled, if not just enable basic
 	// operations such as profiling, server info etc.
-	registerAdminRouter(router, enableConfigOps)
+	registerAdminRouter(router, false)
 
 	// Add healthcheck router
 	registerHealthCheckRouter(router)
@@ -264,13 +260,21 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
-	httpServer := xhttp.NewServer([]string{globalMinioAddr},
-		criticalErrorHandler{corsHandler(router)}, getCert)
+	listeners := ctx.Int("listeners")
+	if listeners == 0 {
+		listeners = 1
+	}
+	addrs := make([]string, 0, listeners)
+	for i := 0; i < listeners; i++ {
+		addrs = append(addrs, globalMinioAddr)
+	}
+
+	httpServer := xhttp.NewServer(addrs, setCriticalErrorHandler(corsHandler(router)), getCert)
 	httpServer.BaseContext = func(listener net.Listener) context.Context {
 		return GlobalContext
 	}
 	go func() {
-		globalHTTPServerErrorCh <- httpServer.Start()
+		globalHTTPServerErrorCh <- httpServer.Start(GlobalContext)
 	}()
 
 	globalObjLayerMutex.Lock()
@@ -282,7 +286,6 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		SecretKey: globalActiveCred.SecretKey,
 	})
 	if err != nil {
-		globalHTTPServer.Shutdown()
 		logger.FatalIf(err, "Unable to initialize gateway backend")
 	}
 	newObject = NewGatewayLayerWithLocker(newObject)
@@ -303,10 +306,7 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		logger.FatalIf(globalNotificationSys.Init(GlobalContext, buckets, newObject), "Unable to initialize notification system")
 	}
 
-	// Initialize users credentials and policies in background.
-	globalIAMSys.InitStore(newObject)
-
-	go globalIAMSys.Init(GlobalContext, newObject)
+	go globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalRefreshIAMInterval)
 
 	if globalCacheConfig.Enabled {
 		// initialize the new disk cache objects.
@@ -345,18 +345,14 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	}
 
 	if globalBrowserEnabled {
-		consoleSrv, err := initConsoleServer()
+		globalConsoleSrv, err = initConsoleServer()
 		if err != nil {
 			logger.FatalIf(err, "Unable to initialize console service")
 		}
 
 		go func() {
-			<-globalOSSignalCh
-			consoleSrv.Shutdown()
+			logger.FatalIf(globalConsoleSrv.Serve(), "Unable to initialize console server")
 		}()
-
-		consoleSrv.Serve()
-	} else {
-		<-globalOSSignalCh
 	}
+	<-globalOSSignalCh
 }
